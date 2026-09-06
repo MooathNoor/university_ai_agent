@@ -141,10 +141,7 @@ def route_question(user_input):
 
 def extract_course_name(user_input):
     """
-    Try to extract the course name from the user's question.
-
-    This is a simple first version.
-    Later we can replace this with a proper course database.
+    Extract a known course name from the user's question.
     """
 
     text = user_input.lower()
@@ -216,7 +213,35 @@ while True:
             f"{ai_time:.2f} seconds"
         )
 
-        print("Agent:", response["message"]["content"])
+        print(
+            "Agent:",
+            response["message"]["content"]
+        )
+
+        total_time = time.time() - start_total
+
+        print(
+            f"[DEBUG] Total time: "
+            f"{total_time:.2f} seconds"
+        )
+
+        continue
+
+    # -----------------------------------
+    # CHECK COURSE NAME BEFORE AI TOOL CALL
+    # -----------------------------------
+
+    course_name = extract_course_name(user_input)
+
+    if course_name is None:
+
+        print(
+            "[DEBUG] No course name found in user question."
+        )
+
+        print(
+            "Agent: Please provide the course name."
+        )
 
         total_time = time.time() - start_total
 
@@ -262,38 +287,8 @@ while True:
             print(f"[DEBUG] Tool: {tool_name}")
             print(f"[DEBUG] Arguments: {arguments}")
 
-            # -----------------------------------
-            # FIX: If AI did not provide course name
-            # -----------------------------------
-
-            if "course_name" not in arguments:
-
-                course_name = extract_course_name(user_input)
-
-                if course_name:
-
-                    arguments["course_name"] = course_name
-
-                    print(
-                        f"[DEBUG] Extracted course name: "
-                        f"{course_name}"
-                    )
-
-                else:
-
-                    result = {
-                        "status": "Error",
-                        "message": "Course name was not provided."
-                    }
-
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "content": json.dumps(result)
-                        }
-                    )
-
-                    continue
+            # Always use the course name detected from the user's question.
+            arguments["course_name"] = course_name
 
             tool_function = available_tools.get(tool_name)
 
@@ -331,6 +326,24 @@ while True:
                     f"{tool_time:.2f} seconds"
                 )
 
+            print(
+                f"[DEBUG] Tool result: "
+                f"{result}"
+            )
+
+            # -----------------------------------
+            # HANDLE TOOL ERROR DIRECTLY
+            # -----------------------------------
+
+            if result.get("status") == "Unknown":
+
+                print(
+                    f"Agent: The course '{course_name}' "
+                    f"is not available in the university system."
+                )
+
+                break
+
             messages.append(
                 {
                     "role": "tool",
@@ -338,27 +351,33 @@ while True:
                 }
             )
 
-        print("[DEBUG] Messages before final response:")
-        print(messages)
+        else:
 
-        start_final = time.time()
+            # -----------------------------------
+            # FINAL AI RESPONSE
+            # -----------------------------------
 
-        final_response = ollama.chat(
-            model="llama3.2:3b",
-            messages=messages
-        )
+            print("[DEBUG] Messages before final response:")
+            print(messages)
 
-        final_time = time.time() - start_final
+            start_final = time.time()
 
-        print(
-            f"[DEBUG] Final AI response time: "
-            f"{final_time:.2f} seconds"
-        )
+            final_response = ollama.chat(
+                model="llama3.2:3b",
+                messages=messages
+            )
 
-        print(
-            "Agent:",
-            final_response["message"]["content"]
-        )
+            final_time = time.time() - start_final
+
+            print(
+                f"[DEBUG] Final AI response time: "
+                f"{final_time:.2f} seconds"
+            )
+
+            print(
+                "Agent:",
+                final_response["message"]["content"]
+            )
 
     else:
 
