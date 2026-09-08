@@ -5,7 +5,13 @@ import time
 from tools import (
     get_attendance,
     get_course_schedule,
-    get_course_info
+    get_course_info,
+    get_my_courses,
+    get_assignments,
+    get_grades,
+    get_announcements,
+    get_quizzes,
+    get_upcoming_deadlines
 )
 
 
@@ -24,6 +30,28 @@ When the user asks about a course schedule, use the schedule tool.
 
 When the user asks about course information such as credit hours,
 instructor, section, or room, use the course info tool.
+
+When the user asks about their courses, current courses,
+registered courses, or what courses they have,
+use the my courses tool.
+
+When the user asks about assignments, homework, tasks,
+or assignment due dates, use the assignments tool.
+
+When the user asks about grades, marks, scores,
+or their current grades, use the grades tool.
+
+When the user asks about announcements, university announcements,
+course announcements, or latest announcements,
+use the announcements tool.
+
+When the user asks about quizzes, tests, or quiz dates,
+use the quizzes tool.
+
+When the user asks about upcoming deadlines,
+what they need to submit soon, upcoming assignments and quizzes,
+or what is due soon,
+use the upcoming deadlines tool.
 
 If the user is greeting you, asking what you can do,
 or asking a general question that does not require university data,
@@ -89,6 +117,78 @@ tools = [
                 "required": ["course_name"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_my_courses",
+            "description": "Get the list of the student's current university courses.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_assignments",
+            "description": "Get the current assignments for the student's courses.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_grades",
+            "description": "Get the student's current grades for their courses.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_announcements",
+            "description": "Get the latest university and course announcements.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_quizzes",
+            "description": "Get the current quizzes for the student's courses.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_upcoming_deadlines",
+            "description": "Get upcoming assignments and quizzes ordered by their due dates.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
     }
 ]
 
@@ -96,7 +196,13 @@ tools = [
 available_tools = {
     "get_attendance": get_attendance,
     "get_course_schedule": get_course_schedule,
-    "get_course_info": get_course_info
+    "get_course_info": get_course_info,
+    "get_my_courses": get_my_courses,
+    "get_assignments": get_assignments,
+    "get_grades": get_grades,
+    "get_announcements": get_announcements,
+    "get_quizzes": get_quizzes,
+    "get_upcoming_deadlines": get_upcoming_deadlines
 }
 
 
@@ -105,31 +211,68 @@ def route_question(user_input):
 
     tool_keywords = [
         "attendance",
-        "حضور",
-        "غياب",
+        "طط¶ظˆط±",
+        "ط؛ظٹط§ط¨",
 
         "schedule",
-        "جدول",
+        "ط¬ط¯ظˆظ„",
         "when",
-        "متى",
-        "وقت",
+        "ظ…طھظ‰",
+        "ظˆظ‚طھ",
 
         "credit hours",
         "credit hour",
-        "ساعات",
+        "ط³ط§ط¹ط§طھ",
 
         "instructor",
-        "دكتور",
+        "ط¯ظƒطھظˆط±",
         "teacher",
 
         "section",
-        "شعبة",
+        "ط´ط¹ط¨ط©",
 
         "room",
-        "قاعة",
+        "ظ‚ط§ط¹ط©",
 
         "course information",
-        "معلومات المادة"
+        "ظ…ط¹ظ„ظˆظ…ط§طھ ط§ظ„ظ…ط§ط©",
+
+        "my courses",
+        "current courses",
+        "registered courses",
+        "my subjects",
+        "what courses",
+        "courses",
+
+        "assignments",
+        "assignment",
+        "homework",
+        "tasks",
+        "due dates",
+
+        "grades",
+        "grade",
+        "marks",
+        "mark",
+        "scores",
+        "score",
+
+        "announcements",
+        "announcement",
+        "latest announcements",
+
+        "quizzes",
+        "quiz",
+        "tests",
+        "test",
+        "quiz dates",
+
+        "deadlines",
+        "deadline",
+        "upcoming deadlines",
+        "due soon",
+        "submit soon",
+        "what do i need to submit"
     ]
 
     for keyword in tool_keywords:
@@ -228,6 +371,415 @@ while True:
         continue
 
     # -----------------------------------
+    # MY COURSES
+    # -----------------------------------
+
+    if any(
+        keyword in user_input.lower()
+        for keyword in [
+            "my courses",
+            "current courses",
+            "registered courses",
+            "my subjects",
+            "what courses",
+            "courses"
+        ]
+    ):
+
+        print("[DEBUG] My courses requested.")
+
+        start_tool = time.time()
+
+        result = get_my_courses()
+
+        tool_time = time.time() - start_tool
+
+        print(
+            f"[DEBUG] Tool execution time: "
+            f"{tool_time:.2f} seconds"
+        )
+
+        print(
+            f"[DEBUG] Tool result: "
+            f"{result}"
+        )
+
+        messages.append(
+            {
+                "role": "tool",
+                "content": json.dumps(result)
+            }
+        )
+
+        start_final = time.time()
+
+        final_response = ollama.chat(
+            model="llama3.2:3b",
+            messages=messages
+        )
+
+        final_time = time.time() - start_final
+
+        print(
+            f"[DEBUG] Final AI response time: "
+            f"{final_time:.2f} seconds"
+        )
+
+        print(
+            "Agent:",
+            final_response["message"]["content"]
+        )
+
+        total_time = time.time() - start_total
+
+        print(
+            f"[DEBUG] Total time: "
+            f"{total_time:.2f} seconds"
+        )
+
+        continue
+
+    # -----------------------------------
+    # ASSIGNMENTS
+    # -----------------------------------
+
+    if any(
+        keyword in user_input.lower()
+        for keyword in [
+            "assignments",
+            "assignment",
+            "homework",
+            "tasks",
+            "due dates"
+        ]
+    ):
+
+        print("[DEBUG] Assignments requested.")
+
+        start_tool = time.time()
+
+        result = get_assignments()
+
+        tool_time = time.time() - start_tool
+
+        print(
+            f"[DEBUG] Tool execution time: "
+            f"{tool_time:.2f} seconds"
+        )
+
+        print(
+            f"[DEBUG] Tool result: "
+            f"{result}"
+        )
+
+        messages.append(
+            {
+                "role": "tool",
+                "content": json.dumps(result)
+            }
+        )
+
+        start_final = time.time()
+
+        final_response = ollama.chat(
+            model="llama3.2:3b",
+            messages=messages
+        )
+
+        final_time = time.time() - start_final
+
+        print(
+            f"[DEBUG] Final AI response time: "
+            f"{final_time:.2f} seconds"
+        )
+
+        print(
+            "Agent:",
+            final_response["message"]["content"]
+        )
+
+        total_time = time.time() - start_total
+
+        print(
+            f"[DEBUG] Total time: "
+            f"{total_time:.2f} seconds"
+        )
+
+        continue
+
+    # -----------------------------------
+    # GRADES
+    # -----------------------------------
+
+    if any(
+        keyword in user_input.lower()
+        for keyword in [
+            "grades",
+            "grade",
+            "marks",
+            "mark",
+            "scores",
+            "score"
+        ]
+    ):
+
+        print("[DEBUG] Grades requested.")
+
+        start_tool = time.time()
+
+        result = get_grades()
+
+        tool_time = time.time() - start_tool
+
+        print(
+            f"[DEBUG] Tool execution time: "
+            f"{tool_time:.2f} seconds"
+        )
+
+        print(
+            f"[DEBUG] Tool result: "
+            f"{result}"
+        )
+
+        messages.append(
+            {
+                "role": "tool",
+                "content": json.dumps(result)
+            }
+        )
+
+        start_final = time.time()
+
+        final_response = ollama.chat(
+            model="llama3.2:3b",
+            messages=messages
+        )
+
+        final_time = time.time() - start_final
+
+        print(
+            f"[DEBUG] Final AI response time: "
+            f"{final_time:.2f} seconds"
+        )
+
+        print(
+            "Agent:",
+            final_response["message"]["content"]
+        )
+
+        total_time = time.time() - start_total
+
+        print(
+            f"[DEBUG] Total time: "
+            f"{total_time:.2f} seconds"
+        )
+
+        continue
+
+    # -----------------------------------
+    # ANNOUNCEMENTS
+    # -----------------------------------
+
+    if any(
+        keyword in user_input.lower()
+        for keyword in [
+            "announcements",
+            "announcement",
+            "latest announcements"
+        ]
+    ):
+
+        print("[DEBUG] Announcements requested.")
+
+        start_tool = time.time()
+
+        result = get_announcements()
+
+        tool_time = time.time() - start_tool
+
+        print(
+            f"[DEBUG] Tool execution time: "
+            f"{tool_time:.2f} seconds"
+        )
+
+        print(
+            f"[DEBUG] Tool result: "
+            f"{result}"
+        )
+
+        messages.append(
+            {
+                "role": "tool",
+                "content": json.dumps(result)
+            }
+        )
+
+        start_final = time.time()
+
+        final_response = ollama.chat(
+            model="llama3.2:3b",
+            messages=messages
+        )
+
+        final_time = time.time() - start_final
+
+        print(
+            f"[DEBUG] Final AI response time: "
+            f"{final_time:.2f} seconds"
+        )
+
+        print(
+            "Agent:",
+            final_response["message"]["content"]
+        )
+
+        total_time = time.time() - start_total
+
+        print(
+            f"[DEBUG] Total time: "
+            f"{total_time:.2f} seconds"
+        )
+
+        continue
+
+    # -----------------------------------
+    # QUIZZES
+    # -----------------------------------
+
+    if any(
+        keyword in user_input.lower()
+        for keyword in [
+            "quizzes",
+            "quiz",
+            "tests",
+            "test",
+            "quiz dates"
+        ]
+    ):
+
+        print("[DEBUG] Quizzes requested.")
+
+        start_tool = time.time()
+
+        result = get_quizzes()
+
+        tool_time = time.time() - start_tool
+
+        print(
+            f"[DEBUG] Tool execution time: "
+            f"{tool_time:.2f} seconds"
+        )
+
+        print(
+            f"[DEBUG] Tool result: "
+            f"{result}"
+        )
+
+        messages.append(
+            {
+                "role": "tool",
+                "content": json.dumps(result)
+            }
+        )
+
+        start_final = time.time()
+
+        final_response = ollama.chat(
+            model="llama3.2:3b",
+            messages=messages
+        )
+
+        final_time = time.time() - start_final
+
+        print(
+            f"[DEBUG] Final AI response time: "
+            f"{final_time:.2f} seconds"
+        )
+
+        print(
+            "Agent:",
+            final_response["message"]["content"]
+        )
+
+        total_time = time.time() - start_total
+
+        print(
+            f"[DEBUG] Total time: "
+            f"{total_time:.2f} seconds"
+        )
+
+        continue
+
+    # -----------------------------------
+    # UPCOMING DEADLINES
+    # -----------------------------------
+
+    if any(
+        keyword in user_input.lower()
+        for keyword in [
+            "deadlines",
+            "deadline",
+            "upcoming deadlines",
+            "due soon",
+            "submit soon",
+            "what do i need to submit"
+        ]
+    ):
+
+        print("[DEBUG] Upcoming deadlines requested.")
+
+        start_tool = time.time()
+
+        result = get_upcoming_deadlines()
+
+        tool_time = time.time() - start_tool
+
+        print(
+            f"[DEBUG] Tool execution time: "
+            f"{tool_time:.2f} seconds"
+        )
+
+        print(
+            f"[DEBUG] Tool result: "
+            f"{result}"
+        )
+
+        messages.append(
+            {
+                "role": "tool",
+                "content": json.dumps(result)
+            }
+        )
+
+        start_final = time.time()
+
+        final_response = ollama.chat(
+            model="llama3.2:3b",
+            messages=messages
+        )
+
+        final_time = time.time() - start_final
+
+        print(
+            f"[DEBUG] Final AI response time: "
+            f"{final_time:.2f} seconds"
+        )
+
+        print(
+            "Agent:",
+            final_response["message"]["content"]
+        )
+
+        total_time = time.time() - start_total
+
+        print(
+            f"[DEBUG] Total time: "
+            f"{total_time:.2f} seconds"
+        )
+
+        continue
+
+    # -----------------------------------
     # CHECK COURSE NAME BEFORE AI TOOL CALL
     # -----------------------------------
 
@@ -287,7 +839,6 @@ while True:
             print(f"[DEBUG] Tool: {tool_name}")
             print(f"[DEBUG] Arguments: {arguments}")
 
-            # Always use the course name detected from the user's question.
             arguments["course_name"] = course_name
 
             tool_function = available_tools.get(tool_name)
@@ -331,10 +882,6 @@ while True:
                 f"{result}"
             )
 
-            # -----------------------------------
-            # HANDLE TOOL ERROR DIRECTLY
-            # -----------------------------------
-
             if result.get("status") == "Unknown":
 
                 print(
@@ -352,10 +899,6 @@ while True:
             )
 
         else:
-
-            # -----------------------------------
-            # FINAL AI RESPONSE
-            # -----------------------------------
 
             print("[DEBUG] Messages before final response:")
             print(messages)
