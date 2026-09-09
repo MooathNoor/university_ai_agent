@@ -26,10 +26,27 @@ Use a tool only when the user's question requires specific university data.
 
 When the user asks about attendance, use the attendance tool.
 
-When the user asks about a course schedule, use the schedule tool.
+Important attendance rule:
+- If taken_sessions is 0, do NOT say the student has perfect attendance.
+- If taken_sessions is 0, do NOT say the student missed all sessions.
+- Instead, say that there are currently no recorded attendance sessions.
+- Do not infer attendance status when there are no recorded sessions.
+- Use the exact attendance percentage returned by the tool.
 
-When the user asks about course information such as credit hours,
-instructor, section, or room, use the course info tool.
+When the user asks about a course schedule, use the schedule tool.
+Schedule means days, times, lecture timing, or class timetable.
+
+When the user asks about course information such as:
+- credit hours
+- instructor
+- section
+- room
+- course sections
+- course activities
+- course materials
+- available activities
+- available content
+use the course info tool.
 
 When the user asks about their courses, current courses,
 registered courses, or what courses they have,
@@ -88,7 +105,11 @@ tools = [
         "type": "function",
         "function": {
             "name": "get_course_schedule",
-            "description": "Get the schedule of a university course.",
+            "description": (
+                "Get the timetable/schedule of a university course. "
+                "Use ONLY for class days, lecture times, timetable, "
+                "or when the course is held."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -105,7 +126,15 @@ tools = [
         "type": "function",
         "function": {
             "name": "get_course_info",
-            "description": "Get information about a university course, such as credit hours, instructor, section, and room.",
+            "description": (
+                "Get detailed information about a university course, "
+                "including credit hours, instructor, section, room, "
+                "course sections, activities, course materials, "
+                "available content, assignments, quizzes, forums, "
+                "files, URLs, and other Moodle activities. "
+                "Use this tool when the user asks what is available "
+                "inside a course."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -217,7 +246,7 @@ def route_question(user_input):
         "schedule",
         "ط¬ط¯ظˆظ„",
         "when",
-        "ظ…طھظ‰",
+        "ظ…طھ‰",
         "ظˆظ‚طھ",
 
         "credit hours",
@@ -229,13 +258,22 @@ def route_question(user_input):
         "teacher",
 
         "section",
+        "sections",
         "ط´ط¹ط¨ط©",
 
         "room",
         "ظ‚ط§ط¹ط©",
 
         "course information",
+        "course info",
         "ظ…ط¹ظ„ظˆظ…ط§طھ ط§ظ„ظ…ط§ط©",
+
+        "activities",
+        "activity",
+        "materials",
+        "material",
+        "content",
+        "available",
 
         "my courses",
         "current courses",
@@ -282,30 +320,223 @@ def route_question(user_input):
     return False
 
 
-def extract_course_name(user_input):
+def detect_specific_tool(user_input):
     """
-    Extract a known course name from the user's question.
+    Deterministically identify obvious tool requests.
+
+    This prevents the small local LLM from choosing the wrong
+    tool when the user's wording clearly identifies the request.
     """
 
     text = user_input.lower()
 
-    known_courses = [
-        "artificial intelligence",
-        "data structures",
-        "database management",
-        "computer networks",
-        "wireless networks",
-        "object oriented programming",
-        "internet programming",
-        "robotics",
-        "compilers"
+    # Attendance
+    attendance_keywords = [
+        "attendance"
     ]
 
-    for course in known_courses:
-        if course in text:
-            return course.title()
+    if any(keyword in text for keyword in attendance_keywords):
+        return "get_attendance"
+
+    # Course information
+    course_info_keywords = [
+        "credit hours",
+        "credit hour",
+        "instructor",
+        "teacher",
+        "section",
+        "sections",
+        "room",
+        "course information",
+        "course info",
+        "activities",
+        "activity",
+        "materials",
+        "material",
+        "course content",
+        "available content"
+    ]
+
+    if any(keyword in text for keyword in course_info_keywords):
+        return "get_course_info"
+
+    # Course schedule
+    schedule_keywords = [
+        "schedule",
+        "timetable",
+        "class time",
+        "lecture time",
+        "what time",
+        "when is"
+    ]
+
+    if any(keyword in text for keyword in schedule_keywords):
+        return "get_course_schedule"
 
     return None
+
+
+def extract_course_name(user_input):
+    """
+    Find the course mentioned in the user's question
+    using the real course list from Moodle.
+    """
+
+    text = user_input.lower().strip()
+
+    print("[DEBUG] Searching for course name in Moodle courses...")
+
+    try:
+        courses = get_my_courses()
+    except Exception as error:
+        print(f"[DEBUG] Could not load Moodle courses: {error}")
+        return None
+
+    if not courses:
+        print("[DEBUG] No courses found.")
+        return None
+
+    # First: try matching the complete course name
+    for course in courses:
+        course_name = course.get("name", "").strip()
+
+        if not course_name:
+            continue
+
+        if course_name.lower() in text:
+            print(f"[DEBUG] Course found: {course_name}")
+            return course_name
+
+    # Second: match meaningful words from course name
+    stop_words = {
+        "the",
+        "and",
+        "of",
+        "for",
+        "in",
+        "to",
+        "a",
+        "an",
+        "course",
+        "class"
+    }
+
+    for course in courses:
+        course_name = course.get("name", "").strip()
+
+        if not course_name:
+            continue
+
+        words = course_name.lower().replace("-", " ").split()
+
+        meaningful_words = [
+            word
+            for word in words
+            if len(word) >= 5 and word not in stop_words
+        ]
+
+        if not meaningful_words:
+            continue
+
+        matched_words = [
+            word
+            for word in meaningful_words
+            if word in text
+        ]
+
+        if len(matched_words) >= 2:
+            print(
+                f"[DEBUG] Course found by word matching: "
+                f"{course_name}"
+            )
+            return course_name
+
+    print("[DEBUG] No matching course found.")
+    return None
+
+
+def format_course_info_response(result):
+    """
+    Build a direct response from real Moodle course information.
+
+    This avoids sending the complete course structure to the
+    local LLM when the user explicitly asks for sections
+    and activities.
+    """
+
+    if not isinstance(result, dict):
+        return "I could not read the course information."
+
+    course_name = result.get("name", "Unknown course")
+    sections = result.get("sections", [])
+
+    lines = []
+
+    lines.append(
+        f"Course: {course_name}"
+    )
+
+    lines.append("")
+    lines.append(
+        f"Sections ({len(sections)}):"
+    )
+
+    total_activities = 0
+
+    for index, section in enumerate(sections, start=1):
+
+        if not isinstance(section, dict):
+            continue
+
+        section_name = section.get(
+            "name",
+            "Unnamed section"
+        )
+
+        activities = section.get(
+            "activities",
+            []
+        )
+
+        total_activities += len(activities)
+
+        lines.append(
+            f"{index}. {section_name}"
+        )
+
+        if not activities:
+
+            lines.append(
+                "   - No activities"
+            )
+
+            continue
+
+        for activity in activities:
+
+            if not isinstance(activity, dict):
+                continue
+
+            activity_name = activity.get(
+                "name",
+                "Unnamed activity"
+            )
+
+            activity_type = activity.get(
+                "type",
+                "Unknown"
+            )
+
+            lines.append(
+                f"   - {activity_name} [{activity_type}]"
+            )
+
+    lines.append("")
+    lines.append(
+        f"Total activities: {total_activities}"
+    )
+
+    return "\n".join(lines)
 
 
 while True:
@@ -780,7 +1011,7 @@ while True:
         continue
 
     # -----------------------------------
-    # CHECK COURSE NAME BEFORE AI TOOL CALL
+    # CHECK COURSE NAME
     # -----------------------------------
 
     course_name = extract_course_name(user_input)
@@ -805,7 +1036,191 @@ while True:
         continue
 
     # -----------------------------------
-    # TOOL
+    # DETERMINE SPECIFIC TOOL
+    # -----------------------------------
+
+    forced_tool = detect_specific_tool(user_input)
+
+    if forced_tool:
+
+        print(
+            f"[DEBUG] Deterministic tool selection: "
+            f"{forced_tool}"
+        )
+
+        tool_name = forced_tool
+
+        arguments = {
+            "course_name": course_name
+        }
+
+        tool_function = available_tools.get(tool_name)
+
+        if tool_function is None:
+
+            result = {
+                "status": "Error",
+                "message": "Unknown tool."
+            }
+
+        else:
+
+            print(f"[DEBUG] Tool: {tool_name}")
+            print(f"[DEBUG] Arguments: {arguments}")
+
+            start_tool = time.time()
+
+            try:
+                result = tool_function(**arguments)
+
+            except TypeError as error:
+
+                print(
+                    f"[DEBUG] Tool argument error: "
+                    f"{error}"
+                )
+
+                result = {
+                    "status": "Error",
+                    "message": "Required tool arguments were missing."
+                }
+
+            tool_time = time.time() - start_tool
+
+            print(
+                f"[DEBUG] Tool execution time: "
+                f"{tool_time:.2f} seconds"
+            )
+
+        print(
+            f"[DEBUG] Tool result: "
+            f"{result}"
+        )
+
+        if result.get("status") == "Unknown":
+
+            print(
+                f"Agent: The course '{course_name}' "
+                f"is not available in the university system."
+            )
+
+            continue
+
+        # -----------------------------------
+        # ATTENDANCE RESPONSE
+        # -----------------------------------
+
+        if tool_name == "get_attendance":
+
+            taken_sessions = str(
+                result.get("taken_sessions", "")
+            ).strip()
+
+            percentage = str(
+                result.get("percentage", "")
+            ).strip()
+
+            returned_course = result.get(
+                "course",
+                course_name
+            )
+
+            if taken_sessions == "0":
+
+                print(
+                    "[DEBUG] Attendance has zero recorded sessions."
+                )
+
+                print(
+                    "Agent:",
+                    f"There are currently no recorded attendance "
+                    f"sessions for {returned_course}. "
+                    f"The recorded attendance percentage is "
+                    f"{percentage}."
+                )
+
+                total_time = time.time() - start_total
+
+                print(
+                    f"[DEBUG] Total time: "
+                    f"{total_time:.2f} seconds"
+                )
+
+                continue
+
+        # -----------------------------------
+        # DIRECT COURSE INFO RESPONSE
+        # -----------------------------------
+
+        if tool_name == "get_course_info":
+
+            print(
+                "[DEBUG] Building course information response "
+                "directly from Moodle data..."
+            )
+
+            direct_response = format_course_info_response(
+                result
+            )
+
+            print(
+                "Agent:",
+                direct_response
+            )
+
+            total_time = time.time() - start_total
+
+            print(
+                f"[DEBUG] Total time: "
+                f"{total_time:.2f} seconds"
+            )
+
+            continue
+
+        # -----------------------------------
+        # PREPARE TOOL RESULT FOR AI
+        # -----------------------------------
+
+        messages.append(
+            {
+                "role": "tool",
+                "content": json.dumps(
+                    result,
+                    ensure_ascii=False
+                )
+            }
+        )
+
+        start_final = time.time()
+
+        final_response = ollama.chat(
+            model="llama3.2:3b",
+            messages=messages
+        )
+
+        final_time = time.time() - start_final
+
+        print(
+            f"[DEBUG] Final AI response time: "
+            f"{final_time:.2f} seconds"
+        )
+
+        print(
+            "Agent:",
+            final_response["message"]["content"]
+        )
+
+        total_time = time.time() - start_total
+
+        print(
+            f"[DEBUG] Total time: "
+            f"{total_time:.2f} seconds"
+        )
+
+        continue
+
+    # -----------------------------------
+    # AI TOOL DECISION
     # -----------------------------------
 
     start_ai = time.time()
@@ -855,7 +1270,6 @@ while True:
                 start_tool = time.time()
 
                 try:
-
                     result = tool_function(**arguments)
 
                 except TypeError as error:
@@ -891,10 +1305,42 @@ while True:
 
                 break
 
+            # -----------------------------------
+            # DIRECT COURSE INFO RESPONSE
+            # -----------------------------------
+
+            if tool_name == "get_course_info":
+
+                print(
+                    "[DEBUG] Building course information response "
+                    "directly from Moodle data..."
+                )
+
+                direct_response = format_course_info_response(
+                    result
+                )
+
+                print(
+                    "Agent:",
+                    direct_response
+                )
+
+                total_time = time.time() - start_total
+
+                print(
+                    f"[DEBUG] Total time: "
+                    f"{total_time:.2f} seconds"
+                )
+
+                break
+
             messages.append(
                 {
                     "role": "tool",
-                    "content": json.dumps(result)
+                    "content": json.dumps(
+                        result,
+                        ensure_ascii=False
+                    )
                 }
             )
 
@@ -902,6 +1348,48 @@ while True:
 
             print("[DEBUG] Messages before final response:")
             print(messages)
+
+            # -----------------------------------
+            # ATTENDANCE RESPONSE
+            # -----------------------------------
+
+            if tool_name == "get_attendance":
+
+                taken_sessions = str(
+                    result.get("taken_sessions", "")
+                ).strip()
+
+                percentage = str(
+                    result.get("percentage", "")
+                ).strip()
+
+                returned_course = result.get(
+                    "course",
+                    course_name
+                )
+
+                if taken_sessions == "0":
+
+                    print(
+                        "[DEBUG] Attendance has zero recorded sessions."
+                    )
+
+                    print(
+                        "Agent:",
+                        f"There are currently no recorded attendance "
+                        f"sessions for {returned_course}. "
+                        f"The recorded attendance percentage is "
+                        f"{percentage}."
+                    )
+
+                    total_time = time.time() - start_total
+
+                    print(
+                        f"[DEBUG] Total time: "
+                        f"{total_time:.2f} seconds"
+                    )
+
+                    continue
 
             start_final = time.time()
 
