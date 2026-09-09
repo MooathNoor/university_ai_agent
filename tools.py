@@ -1,14 +1,68 @@
 from datetime import datetime
+import time
 
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
 from lms_client import (
     login,
     session,
     BASE_URL,
     get_courses,
-    get_assignments as lms_get_assignments
+    get_assignments as lms_get_assignments,
+    get_quizzes as lms_get_quizzes
 )
+
+
+# ============================================================
+# COURSE CACHE
+# ============================================================
+
+COURSE_CACHE_SECONDS = 60
+
+_courses_cache = None
+_courses_cache_time = 0
+
+
+def get_cached_courses():
+    """
+    Get the student's Moodle courses.
+
+    Courses are cached for a short period to avoid repeatedly
+    requesting the same course list from Moodle.
+    """
+
+    global _courses_cache
+    global _courses_cache_time
+
+    current_time = time.time()
+
+    # --------------------------------------------------------
+    # Use cache if it is still valid
+    # --------------------------------------------------------
+
+    if (
+        _courses_cache is not None
+        and
+        current_time - _courses_cache_time < COURSE_CACHE_SECONDS
+    ):
+        print("\nUsing cached Moodle courses...")
+        return _courses_cache
+
+    # --------------------------------------------------------
+    # Cache expired or does not exist
+    # --------------------------------------------------------
+
+    print("\nLoading courses from Moodle...")
+
+    courses = get_courses()
+
+    if courses:
+
+        _courses_cache = courses
+        _courses_cache_time = current_time
+
+    return courses
 
 
 # ============================================================
@@ -18,15 +72,6 @@ from lms_client import (
 def get_attendance(course_name):
     """
     Get real attendance information from Moodle.
-
-    The function:
-        1. Logs in to Moodle.
-        2. Finds the requested course.
-        3. Opens the course page.
-        4. Finds the Attendance activity dynamically.
-        5. Opens the Attendance page.
-        6. Reads attendance summary information.
-        7. Reads attendance sessions.
 
     This function is read-only.
     It does not submit or modify attendance.
@@ -40,7 +85,7 @@ def get_attendance(course_name):
             "message": "Could not log in to Moodle."
         }
 
-    courses = get_courses()
+    courses = get_cached_courses()
 
     if not courses:
         return {
@@ -134,7 +179,10 @@ def get_attendance(course_name):
         href = link.get("href", "")
 
         if "/mod/attendance/view.php?id=" in href:
-            attendance_url = href
+            attendance_url = urljoin(
+                course_url,
+                href
+            )
             break
 
     if not attendance_url:
@@ -269,36 +317,244 @@ def get_attendance(course_name):
 
 def get_course_schedule(course_name):
     """
-    Get course schedule.
+    Try to get real schedule/event information
+    for a specific course from Moodle Calendar.
 
-    Currently this function still uses mock data.
+    IMPORTANT:
+    Moodle Calendar may contain course events and deadlines,
+    but it may NOT contain the university's weekly lecture
+    timetable.
+
+    Therefore this function never returns fake schedule data.
     """
 
-    schedules = {
-        "Artificial Intelligence": {
-            "day": "Sunday",
-            "time": "10:00 AM",
-            "room": "Lab 2"
-        },
-        "Database": {
-            "day": "Monday",
-            "time": "12:00 PM",
-            "room": "Room 15"
-        },
-        "Python": {
-            "day": "Tuesday",
-            "time": "10:00 AM",
-            "room": "Lab 1"
-        }
-    }
+    print(
+        "\nConnecting to Moodle Calendar "
+        "to get real schedule information..."
+    )
 
-    if course_name not in schedules:
+    if not course_name:
         return {
             "status": "Unknown",
-            "message": "Course not found."
+            "message": "Course name was not provided."
         }
 
-    return schedules[course_name]
+    if not login():
+        return {
+            "status": "Error",
+            "message": "Could not log in to Moodle."
+        }
+
+    courses = get_cached_courses()
+
+    if not courses:
+        return {
+            "status": "Error",
+            "message": "No courses were found in Moodle."
+        }
+
+    search_text = course_name.lower().strip()
+
+    selected_course = None
+
+    for course in courses:
+
+        if course["name"].lower().strip() == search_text:
+            selected_course = course
+            break
+
+    if not selected_course:
+
+        for course in courses:
+
+            course_text = course["name"].lower()
+
+            if search_text in course_text:
+                selected_course = course
+                break
+
+    if not selected_course:
+
+        search_words = [
+            word
+            for word in search_text.split()
+            if len(word) >= 5
+        ]
+
+        for course in courses:
+
+            course_text = course["name"].lower()
+
+            for word in search_words:
+
+                if word in course_text:
+                    selected_course = course
+                    break
+
+            if selected_course:
+                break
+
+    if not selected_course:
+
+        return {
+            "status": "Unknown",
+            "message": (
+                f"Course not found in Moodle: "
+                f"{course_name}"
+            )
+        }
+
+    real_course_name = selected_course["name"]
+    course_id = selected_course["id"]
+
+    print(
+        f"Course found: "
+        f"{real_course_name}"
+    )
+
+    calendar_url = (
+        f"{BASE_URL}/calendar/view.php"
+        f"?view=month"
+        f"&course={course_id}"
+    )
+
+    print(
+        f"\nOpening Moodle Calendar:"
+    )
+    print(calendar_url)
+
+    calendar_response = session.get(
+        calendar_url
+    )
+
+    print(
+        f"Calendar page status: "
+        f"{calendar_response.status_code}"
+    )
+
+    if calendar_response.status_code != 200:
+
+        return {
+            "status": "Error",
+            "message": (
+                "Could not open the Moodle "
+                "Calendar page."
+            )
+        }
+
+    calendar_soup = BeautifulSoup(
+        calendar_response.text,
+        "html.parser"
+    )
+
+    events = []
+
+    possible_event_selectors = [
+        ".calendar_event",
+        ".event",
+        ".calendar_event_course",
+        ".calendar_event_user",
+        ".calendar_event_global",
+        "[data-event-id]",
+        "[data-eventtype]"
+    ]
+
+    event_elements = []
+
+    for selector in possible_event_selectors:
+
+        found_elements = calendar_soup.select(
+            selector
+        )
+
+        for element in found_elements:
+
+            if element not in event_elements:
+                event_elements.append(element)
+
+    print(
+        f"Possible calendar event elements found: "
+        f"{len(event_elements)}"
+    )
+
+    for element in event_elements:
+
+        event_text = element.get_text(
+            " ",
+            strip=True
+        )
+
+        if not event_text:
+            continue
+
+        event_url = None
+
+        link = element.find(
+            "a",
+            href=True
+        )
+
+        if link:
+
+            event_url = urljoin(
+                calendar_url,
+                link["href"]
+            )
+
+        events.append({
+            "course": real_course_name,
+            "course_id": course_id,
+            "title": event_text,
+            "url": event_url
+        })
+
+    unique_events = []
+
+    seen = set()
+
+    for event in events:
+
+        key = (
+            event["title"],
+            event["url"]
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        unique_events.append(event)
+
+    events = unique_events
+
+    print(
+        f"Calendar events extracted: "
+        f"{len(events)}"
+    )
+
+    if not events:
+
+        return {
+            "status": "Unknown",
+            "course": real_course_name,
+            "course_id": course_id,
+            "source": "moodle_calendar",
+            "message": (
+                "No calendar events were found for this "
+                "course in Moodle. The university weekly "
+                "lecture timetable may be stored in another "
+                "system."
+            )
+        }
+
+    return {
+        "status": "Success",
+        "course": real_course_name,
+        "course_id": course_id,
+        "source": "moodle_calendar",
+        "events": events
+    }
 
 
 # ============================================================
@@ -308,16 +564,6 @@ def get_course_schedule(course_name):
 def get_course_info(course_name):
     """
     Get real course information from Moodle.
-
-    The function searches the student's Moodle courses
-    and opens the matching course page.
-
-    It returns:
-        - course id
-        - course name
-        - course URL
-        - sections
-        - activities
     """
 
     print(
@@ -331,7 +577,7 @@ def get_course_info(course_name):
             "message": "Could not log in to Moodle."
         }
 
-    courses = get_courses()
+    courses = get_cached_courses()
 
     if not courses:
         return {
@@ -437,10 +683,6 @@ def get_course_info(course_name):
             " ",
             strip=True
         )
-
-    # ========================================================
-    # Extract sections and their activities
-    # ========================================================
 
     sections = []
 
@@ -548,10 +790,6 @@ def get_course_info(course_name):
             "activities": section_activities
         })
 
-    # ========================================================
-    # Extract all activities
-    # ========================================================
-
     activities = []
 
     for link in soup.find_all(
@@ -601,10 +839,6 @@ def get_course_info(course_name):
             "url": href
         })
 
-    # --------------------------------------------------------
-    # Remove duplicate activities
-    # --------------------------------------------------------
-
     unique_activities = []
 
     seen = set()
@@ -622,15 +856,6 @@ def get_course_info(course_name):
         seen.add(key)
 
         unique_activities.append(activity)
-
-    # --------------------------------------------------------
-    # Return compact real Moodle information
-    #
-    # IMPORTANT:
-    # page_text was removed.
-    # The structured sections and activities are enough
-    # for the AI to answer course-information questions.
-    # --------------------------------------------------------
 
     return {
         "id": course_id,
@@ -662,7 +887,7 @@ def get_my_courses():
             "message": "Could not log in to Moodle."
         }
 
-    courses = get_courses()
+    courses = get_cached_courses()
 
     if not courses:
         return {
@@ -698,7 +923,7 @@ def get_assignments(course_name=None):
             "message": "Could not log in to Moodle."
         }
 
-    courses = get_courses()
+    courses = get_cached_courses()
 
     if not courses:
         return {
@@ -706,37 +931,88 @@ def get_assignments(course_name=None):
             "message": "No courses were found in Moodle."
         }
 
-    all_assignments = []
+    if course_name:
 
-    for course in courses:
+        search_text = course_name.lower().strip()
 
-        if course_name:
+        selected_course = None
 
-            search_text = course_name.lower().strip()
+        for course in courses:
+
             course_text = course["name"].lower()
 
-            direct_match = (
-                search_text in course_text
-            )
+            if search_text == course_text:
+                selected_course = course
+                break
 
-            word_match = False
+        if not selected_course:
 
-            if not direct_match:
+            for course in courses:
 
-                search_words = [
-                    word
-                    for word in search_text.split()
-                    if len(word) >= 5
-                ]
+                course_text = course["name"].lower()
+
+                if search_text in course_text:
+                    selected_course = course
+                    break
+
+        if not selected_course:
+
+            search_words = [
+                word
+                for word in search_text.split()
+                if len(word) >= 5
+            ]
+
+            for course in courses:
+
+                course_text = course["name"].lower()
 
                 for word in search_words:
 
                     if word in course_text:
-                        word_match = True
+                        selected_course = course
                         break
 
-            if not direct_match and not word_match:
-                continue
+                if selected_course:
+                    break
+
+        if not selected_course:
+
+            return {
+                "status": "Unknown",
+                "message": (
+                    f"Course not found in Moodle: "
+                    f"{course_name}"
+                )
+            }
+
+        print(
+            f"\nGetting assignments for selected course: "
+            f"{selected_course['name']}"
+        )
+
+        assignments = lms_get_assignments(
+            selected_course["id"]
+        )
+
+        for assignment in assignments:
+            assignment["course"] = selected_course["name"]
+
+        if not assignments:
+
+            return {
+                "status": "Unknown",
+                "message": (
+                    f"No assignments found for course: "
+                    f"{selected_course['name']}"
+                )
+            }
+
+        return assignments
+
+    all_assignments = []
+
+    for course in courses:
 
         print(
             f"\nGetting assignments for: "
@@ -755,15 +1031,6 @@ def get_assignments(course_name=None):
                 assignment
             )
 
-    if course_name and not all_assignments:
-        return {
-            "status": "Unknown",
-            "message": (
-                f"No assignments found for course: "
-                f"{course_name}"
-            )
-        }
-
     return all_assignments
 
 
@@ -775,7 +1042,7 @@ def get_grades():
     """
     Get student grades.
 
-    Currently this function still uses mock data.
+    Currently uses mock data.
     """
 
     return [
@@ -805,7 +1072,7 @@ def get_announcements():
     """
     Get university announcements.
 
-    Currently this function still uses mock data.
+    Currently uses mock data.
     """
 
     return [
@@ -831,36 +1098,149 @@ def get_announcements():
 # 8. GET QUIZZES
 # ============================================================
 
-def get_quizzes():
+def get_quizzes(course_name=None):
     """
-    Get quizzes.
+    Return real quizzes from Moodle.
 
-    Currently this function still uses mock data.
+    If course_name is provided:
+        ONLY that course is searched.
+
+    If course_name is not provided:
+        all available Moodle courses are searched.
     """
 
-    return [
-        {
-            "course": "Artificial Intelligence",
-            "title": "AI Quiz 1",
-            "available_date": "2026-09-09",
-            "due_date": "2026-09-10",
-            "status": "Upcoming"
-        },
-        {
-            "course": "Database",
-            "title": "SQL Quiz 1",
-            "available_date": "2026-09-11",
-            "due_date": "2026-09-12",
-            "status": "Upcoming"
-        },
-        {
-            "course": "Python",
-            "title": "Python Quiz 1",
-            "available_date": "2026-09-09",
-            "due_date": "2026-09-11",
-            "status": "Upcoming"
+    print(
+        "\nConnecting to Moodle to get real quizzes..."
+    )
+
+    if not login():
+        return {
+            "status": "Error",
+            "message": "Could not log in to Moodle."
         }
-    ]
+
+    courses = get_cached_courses()
+
+    if not courses:
+        return {
+            "status": "Error",
+            "message": "No courses were found in Moodle."
+        }
+
+    if course_name:
+
+        search_text = course_name.lower().strip()
+
+        selected_course = None
+
+        for course in courses:
+
+            course_text = course["name"].lower()
+
+            if search_text == course_text:
+
+                selected_course = course
+                break
+
+        if not selected_course:
+
+            for course in courses:
+
+                course_text = course["name"].lower()
+
+                if search_text in course_text:
+
+                    selected_course = course
+                    break
+
+        if not selected_course:
+
+            search_words = [
+                word
+                for word in search_text.split()
+                if len(word) >= 5
+            ]
+
+            for course in courses:
+
+                course_text = course["name"].lower()
+
+                matched = False
+
+                for word in search_words:
+
+                    if word in course_text:
+
+                        matched = True
+                        break
+
+                if matched:
+
+                    selected_course = course
+                    break
+
+        if not selected_course:
+
+            return {
+                "status": "Unknown",
+                "message": (
+                    f"Course not found in Moodle: "
+                    f"{course_name}"
+                )
+            }
+
+        print(
+            f"\nGetting quizzes for SELECTED course ONLY: "
+            f"{selected_course['name']}"
+        )
+
+        quizzes = lms_get_quizzes(
+            selected_course["id"]
+        )
+
+        for quiz in quizzes:
+
+            quiz["course"] = selected_course["name"]
+
+        print(
+            f"Selected course quizzes returned: "
+            f"{len(quizzes)}"
+        )
+
+        if not quizzes:
+
+            return {
+                "status": "Unknown",
+                "message": (
+                    f"No quizzes found for course: "
+                    f"{selected_course['name']}"
+                )
+            }
+
+        return quizzes
+
+    all_quizzes = []
+
+    for course in courses:
+
+        print(
+            f"\nGetting quizzes for: "
+            f"{course['name']}"
+        )
+
+        quizzes = lms_get_quizzes(
+            course["id"]
+        )
+
+        for quiz in quizzes:
+
+            quiz["course"] = course["name"]
+
+            all_quizzes.append(
+                quiz
+            )
+
+    return all_quizzes
 
 
 # ============================================================
@@ -873,8 +1253,7 @@ def get_upcoming_deadlines():
 
     Past assignments are excluded.
 
-    Quizzes are intentionally not included yet because
-    get_quizzes() still contains mock data.
+    Quizzes are not included yet.
     """
 
     assignments = get_assignments()
@@ -930,11 +1309,35 @@ def get_upcoming_deadlines():
                 )
             })
 
-    deadlines.sort(
-        key=lambda item: datetime.strptime(
-            item["due_date"].strip(),
-            "%d/%m/%Y, %I:%M %p"
+    if deadlines:
+
+        def parse_deadline_date(item):
+
+            due_date = item["due_date"].strip()
+
+            date_formats = [
+                "%d/%m/%Y, %I:%M %p",
+                "%d/%m/%Y %I:%M %p",
+                "%d-%m-%Y, %I:%M %p",
+                "%d-%m-%Y %I:%M %p",
+                "%Y-%m-%d %H:%M"
+            ]
+
+            for date_format in date_formats:
+
+                try:
+                    return datetime.strptime(
+                        due_date,
+                        date_format
+                    )
+
+                except ValueError:
+                    continue
+
+            return datetime.max
+
+        deadlines.sort(
+            key=parse_deadline_date
         )
-    )
 
     return deadlines
