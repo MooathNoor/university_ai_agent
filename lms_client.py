@@ -1,54 +1,82 @@
 import os
+import re
 import requests
+
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 
-# =========================================================
-# LOAD ENVIRONMENT VARIABLES
-# =========================================================
+# ============================================================
+# Environment
+# ============================================================
 
 load_dotenv()
 
-BAU_USERNAME = os.getenv("BAU_USERNAME")
-BAU_PASSWORD = os.getenv("BAU_PASSWORD")
+USERNAME = os.getenv("BAU_USERNAME")
+PASSWORD = os.getenv("BAU_PASSWORD")
 
 
-# =========================================================
-# MOODLE CONFIGURATION
-# =========================================================
+# ============================================================
+# Moodle URLs
+# ============================================================
 
 BASE_URL = "https://elearning3.bau.edu.jo/huson"
 
 LOGIN_URL = f"{BASE_URL}/login/index.php"
 MY_COURSES_URL = f"{BASE_URL}/my/"
+AJAX_URL = f"{BASE_URL}/lib/ajax/service.php"
 
-REQUEST_TIMEOUT = 15
 
-
-# =========================================================
-# SESSION
-# =========================================================
+# ============================================================
+# Session
+# ============================================================
 
 session = requests.Session()
 
-session.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/140.0.0.0 Safari/537.36"
-    )
-})
+session.headers.update(
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/139.0.0.0 Safari/537.36"
+        )
+    }
+)
+
+
+# ------------------------------------------------------------
+# Track Moodle authentication state
+# ------------------------------------------------------------
 
 _logged_in = False
 
 
-# =========================================================
-# COURSE PAGE CACHE
-# =========================================================
+# ------------------------------------------------------------
+# Course page cache
+# ------------------------------------------------------------
 
 _course_page_cache = {}
 
+
+# ============================================================
+# Moodle date/time pattern
+# ============================================================
+
+MOODLE_DATETIME_PATTERN = (
+    r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+"
+    r"\d{1,2}\s+"
+    r"(?:January|February|March|April|May|June|July|August|September|"
+    r"October|November|December)\s+"
+    r"\d{4},\s+"
+    r"\d{1,2}:\d{2}\s+"
+    r"(?:AM|PM)"
+)
+
+
+# ============================================================
+# Cache
+# ============================================================
 
 def clear_course_page_cache():
     """
@@ -59,66 +87,23 @@ def clear_course_page_cache():
 
     _course_page_cache = {}
 
-    print("[DEBUG] Course page cache cleared.")
-
 
 def get_cached_course_page(course_id):
     """
-    Get a Moodle course page.
-
-    If the course page was already downloaded during the current
-    process, return it from cache instead of making another request.
+    Return a cached course page if it exists.
     """
 
-    if course_id in _course_page_cache:
-
-        print(
-            f"[DEBUG] Using cached course page "
-            f"for course ID {course_id}"
-        )
-
-        return _course_page_cache[course_id]
-
-    url = f"{BASE_URL}/course/view.php?id={course_id}"
-
-    print(
-        f"[DEBUG] Downloading course page: {url}"
-    )
-
-    response = request_with_relogin(
-        "GET",
-        url
-    )
-
-    if response is None:
-        return None
-
-    if response.status_code != 200:
-
-        print(
-            f"[ERROR] Failed to download course page. "
-            f"Status code: {response.status_code}"
-        )
-
-        return None
-
-    _course_page_cache[course_id] = response.text
-
-    print(
-        f"[DEBUG] Course page cached "
-        f"for course ID {course_id}"
-    )
-
-    return response.text
+    return _course_page_cache.get(course_id)
 
 
-# =========================================================
-# REQUEST HELPERS
-# =========================================================
+# ============================================================
+# HTTP helpers
+# ============================================================
 
 def safe_request(method, url, **kwargs):
     """
-    Send an HTTP request safely.
+    Make a safe HTTP request and handle
+    connection-level errors.
     """
 
     try:
@@ -126,16 +111,16 @@ def safe_request(method, url, **kwargs):
         response = session.request(
             method,
             url,
-            timeout=REQUEST_TIMEOUT,
+            timeout=30,
             **kwargs
         )
 
         return response
 
-    except requests.RequestException as e:
+    except requests.RequestException as error:
 
         print(
-            f"[ERROR] Request failed: {e}"
+            f"Request error: {error}"
         )
 
         return None
@@ -143,7 +128,9 @@ def safe_request(method, url, **kwargs):
 
 def is_session_expired(response):
     """
-    Check whether Moodle redirected us to the login page.
+    Check whether Moodle redirected us
+    to the login page or returned an
+    authentication-related status.
     """
 
     if response is None:
@@ -151,72 +138,52 @@ def is_session_expired(response):
 
     final_url = response.url.lower()
 
-    if "/login/index.php" in final_url:
+    if "/login/" in final_url:
+        return True
+
+    if response.status_code in (401, 403):
         return True
 
     return False
 
 
-def request_with_relogin(method, url, **kwargs):
-    """
-    Send request.
+# ============================================================
+# Login
+# ============================================================
 
-    If the Moodle session expired, login again
-    and retry once.
-    """
-
-    global _logged_in
-
-    response = safe_request(
-        method,
-        url,
-        **kwargs
-    )
-
-    if response is None:
-        return None
-
-    if is_session_expired(response):
-
-        print(
-            "[DEBUG] Moodle session expired. "
-            "Re-logging in..."
-        )
-
-        _logged_in = False
-
-        if not login():
-
-            print(
-                "[ERROR] Re-login failed."
-            )
-
-            return response
-
-        response = safe_request(
-            method,
-            url,
-            **kwargs
-        )
-
-    return response
-
-
-# =========================================================
-# LOGIN
-# =========================================================
-
-def login():
+def login(force=False):
     """
     Login to BAU Moodle.
+
+    If the current Session is already authenticated,
+    do not perform another login.
+
+    force=True can be used when the current Moodle
+    session has expired.
     """
 
     global _logged_in
 
-    if not BAU_USERNAME or not BAU_PASSWORD:
+    # --------------------------------------------------------
+    # Reuse the existing authenticated session
+    # --------------------------------------------------------
+
+    if _logged_in and not force:
 
         print(
-            "[ERROR] BAU_USERNAME or BAU_PASSWORD "
+            "Moodle session already authenticated ✅"
+        )
+
+        return True
+
+    # --------------------------------------------------------
+    # Check credentials
+    # --------------------------------------------------------
+
+    if not USERNAME or not PASSWORD:
+
+        print(
+            "BAU_USERNAME or BAU_PASSWORD "
             "is missing from .env"
         )
 
@@ -230,117 +197,69 @@ def login():
 
     response = safe_request(
         "GET",
-        LOGIN_URL,
-        allow_redirects=True
+        LOGIN_URL
     )
 
     if response is None:
 
-        print(
-            "[ERROR] Could not open Moodle login page."
-        )
+        _logged_in = False
 
         return False
 
     print(
-        f"Login page status: {response.status_code}"
+        f"Login page status: "
+        f"{response.status_code}"
     )
-
-    print(
-        f"Final URL: {response.url}"
-    )
-
-    if response.status_code != 200:
-
-        print(
-            f"[ERROR] Moodle login page returned "
-            f"status code {response.status_code}."
-        )
-
-        return False
 
     soup = BeautifulSoup(
         response.text,
         "html.parser"
     )
 
-    login_form = soup.find(
-        "form",
-        id="login"
-    )
-
-    if not login_form:
-
-        print(
-            "[ERROR] Moodle login form not found."
-        )
-
-        return False
-
-    print(
-        "Moodle login form found ✅"
-    )
-
-    # -----------------------------------------------------
-    # Collect all hidden fields
-    # -----------------------------------------------------
-
-    login_data = {}
-
-    hidden_inputs = login_form.find_all(
+    login_token_input = soup.find(
         "input",
-        type="hidden"
+        {"name": "logintoken"}
     )
 
-    for field in hidden_inputs:
+    login_token = ""
 
-        name = field.get("name")
+    if login_token_input:
 
-        if not name:
-            continue
-
-        value = field.get(
+        login_token = login_token_input.get(
             "value",
             ""
         )
 
-        login_data[name] = value
-
-    if "logintoken" not in login_data:
+    if login_token:
 
         print(
-            "[ERROR] Login token not found."
+            "Login token found ✅"
         )
 
-        return False
+    else:
 
-    print(
-        "Login token found ✅"
-    )
+        print(
+            "Login token not found."
+        )
 
-    # -----------------------------------------------------
-    # Add credentials
-    # -----------------------------------------------------
-
-    login_data["username"] = BAU_USERNAME
-    login_data["password"] = BAU_PASSWORD
+    payload = {
+        "username": USERNAME,
+        "password": PASSWORD,
+        "logintoken": login_token,
+    }
 
     print(
         "Submitting login..."
     )
 
-    response = safe_request(
+    login_response = safe_request(
         "POST",
         LOGIN_URL,
-        data=login_data,
+        data=payload,
         allow_redirects=True
     )
 
-    if response is None:
-
-        print(
-            "[ERROR] Login request failed."
-        )
+    if login_response is None:
 
         _logged_in = False
 
@@ -348,88 +267,132 @@ def login():
 
     print(
         f"Login response status: "
-        f"{response.status_code}"
+        f"{login_response.status_code}"
     )
 
     print(
-        f"Final URL: {response.url}"
+        f"Final URL: "
+        f"{login_response.url}"
     )
 
-    # -----------------------------------------------------
-    # Check whether login failed
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # Moodle keeps failed logins on /login/
+    # --------------------------------------------------------
 
-    final_url = response.url.lower()
-
-    if "/login/index.php" in final_url:
+    if "/login/" in login_response.url.lower():
 
         print(
-            "[ERROR] Moodle login failed."
+            "Login failed ❌"
         )
 
         _logged_in = False
 
         return False
 
-    # -----------------------------------------------------
-    # Check authenticated page
-    # -----------------------------------------------------
-
-    final_html = response.text.lower()
-
-    authenticated = (
-        "/my/" in final_url
-        or "usermenu" in final_html
-        or "logout" in final_html
-    )
-
-    if not authenticated:
-
-        print(
-            "[ERROR] Moodle authentication "
-            "could not be confirmed."
-        )
-
-        _logged_in = False
-
-        return False
+    # --------------------------------------------------------
+    # Login succeeded
+    # --------------------------------------------------------
 
     _logged_in = True
 
     print(
-        "Moodle login successful ✅"
+        "Login successful ✅"
     )
 
     return True
 
 
-# =========================================================
-# GET COURSES
-# =========================================================
+# ============================================================
+# Request with automatic authentication
+# ============================================================
 
-def get_courses():
+def request_with_relogin(method, url, **kwargs):
     """
-    Get the user's Moodle courses.
+    Make an authenticated Moodle request.
+
+    Flow:
+
+    1. If there is no authenticated session,
+       login first.
+    2. Make the request.
+    3. If Moodle says the session expired,
+       force one new login.
+    4. Retry the request once.
     """
 
     global _logged_in
 
+    # --------------------------------------------------------
+    # Make sure we have an authenticated session
+    # --------------------------------------------------------
+
     if not _logged_in:
 
         print(
-            "[DEBUG] Not logged in. Logging in..."
+            "No authenticated Moodle session. "
+            "Logging in..."
         )
 
         if not login():
 
-            return {
-                "status": "Error",
-                "message": "Moodle login failed."
-            }
+            return None
 
-    print(
-        "Opening Moodle My Courses page..."
+    # --------------------------------------------------------
+    # First request
+    # --------------------------------------------------------
+
+    response = safe_request(
+        method,
+        url,
+        **kwargs
     )
+
+    if response is None:
+
+        return None
+
+    # --------------------------------------------------------
+    # Check whether Moodle session expired
+    # --------------------------------------------------------
+
+    if is_session_expired(response):
+
+        print(
+            "Moodle session expired. "
+            "Logging in again..."
+        )
+
+        _logged_in = False
+
+        # ----------------------------------------------------
+        # Force a fresh login
+        # ----------------------------------------------------
+
+        if not login(force=True):
+
+            return response
+
+        # ----------------------------------------------------
+        # Retry request once
+        # ----------------------------------------------------
+
+        response = safe_request(
+            method,
+            url,
+            **kwargs
+        )
+
+    return response
+
+
+# ============================================================
+# Sesskey
+# ============================================================
+
+def get_sesskey():
+    """
+    Extract Moodle sesskey from the logged-in page.
+    """
 
     response = request_with_relogin(
         "GET",
@@ -438,499 +401,989 @@ def get_courses():
 
     if response is None:
 
-        return {
-            "status": "Error",
-            "message": "Could not connect to Moodle."
-        }
-
-    if response.status_code != 200:
-
-        return {
-            "status": "Error",
-            "message": (
-                f"Moodle returned status "
-                f"{response.status_code}."
-            )
-        }
+        return None
 
     soup = BeautifulSoup(
         response.text,
         "html.parser"
     )
 
-    courses = []
+    # --------------------------------------------------------
+    # Try standard Moodle JavaScript config
+    # --------------------------------------------------------
 
-    course_links = soup.select(
-        "a.aalink.coursename"
+    sesskey_match = re.search(
+        r'"sesskey"\s*:\s*"([^"]+)"',
+        response.text
     )
 
-    if not course_links:
+    if sesskey_match:
 
-        course_links = soup.select(
-            "a.coursename"
+        return sesskey_match.group(1)
+
+    # --------------------------------------------------------
+    # Try input field
+    # --------------------------------------------------------
+
+    sesskey_input = soup.find(
+        "input",
+        {"name": "sesskey"}
+    )
+
+    if sesskey_input:
+
+        return sesskey_input.get(
+            "value"
         )
 
-    for link in course_links:
+    # --------------------------------------------------------
+    # Try links containing sesskey
+    # --------------------------------------------------------
+
+    sesskey_match = re.search(
+        r"sesskey=([A-Za-z0-9]+)",
+        response.text
+    )
+
+    if sesskey_match:
+
+        return sesskey_match.group(1)
+
+    print(
+        "Could not find Moodle sesskey."
+    )
+
+    return None
+
+
+# ============================================================
+# Courses
+# ============================================================
+
+def get_courses():
+    """
+    Dynamically retrieve all courses currently enrolled
+    by the Moodle account.
+
+    No course IDs or course names are hard-coded.
+    """
+
+    sesskey = get_sesskey()
+
+    if not sesskey:
+
+        print(
+            "Could not retrieve sesskey."
+        )
+
+        return []
+
+    payload = [
+        {
+            "index": 0,
+            "methodname": (
+                "core_course_get_enrolled_courses_by_"
+                "timeline_classification"
+            ),
+            "args": {
+                "classification": "all",
+                "limit": 0,
+                "offset": 0,
+                "sort": "fullname",
+            },
+        }
+    ]
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+    params = {
+        "sesskey": sesskey,
+    }
+
+    response = request_with_relogin(
+        "POST",
+        AJAX_URL,
+        params=params,
+        json=payload,
+        headers=headers
+    )
+
+    if response is None:
+
+        return []
+
+    if response.status_code != 200:
+
+        print(
+            f"Courses AJAX request failed: "
+            f"{response.status_code}"
+        )
+
+        return []
+
+    try:
+
+        data = response.json()
+
+    except ValueError:
+
+        print(
+            "Could not decode "
+            "Moodle course JSON."
+        )
+
+        return []
+
+    courses = []
+
+    try:
+
+        results = data[0]["data"]["courses"]
+
+        for course in results:
+
+            course_id = course.get(
+                "id"
+            )
+
+            course_name = course.get(
+                "fullname"
+            )
+
+            if course_id and course_name:
+
+                courses.append(
+                    {
+                        "id": course_id,
+                        "name": course_name,
+                    }
+                )
+
+    except (
+        KeyError,
+        TypeError,
+        IndexError
+    ):
+
+        print(
+            "Unexpected Moodle course "
+            "response format."
+        )
+
+        return []
+
+    return courses
+
+
+# ============================================================
+# Course page
+# ============================================================
+
+def get_course_page(course_id):
+    """
+    Retrieve and cache a Moodle course page.
+    """
+
+    cached_page = get_cached_course_page(
+        course_id
+    )
+
+    if cached_page is not None:
+
+        return cached_page
+
+    course_url = (
+        f"{BASE_URL}/course/view.php?id={course_id}"
+    )
+
+    response = request_with_relogin(
+        "GET",
+        course_url
+    )
+
+    if response is None:
+
+        return None
+
+    if response.status_code != 200:
+
+        print(
+            f"Could not open course {course_id}: "
+            f"{response.status_code}"
+        )
+
+        return None
+
+    soup = BeautifulSoup(
+        response.text,
+        "html.parser"
+    )
+
+    _course_page_cache[course_id] = soup
+
+    return soup
+
+
+# ============================================================
+# Assignment due date
+# ============================================================
+
+def extract_assignment_due_date(soup):
+    """
+    Extract only the Moodle assignment due date/time.
+
+    Example:
+
+    Tuesday, 14 July 2026, 2:00 PM
+
+    The assignment description is intentionally
+    excluded from the returned date.
+    """
+
+    page_text = soup.get_text(
+        " ",
+        strip=True
+    )
+
+    # --------------------------------------------------------
+    # Standard Moodle "Due:"
+    # --------------------------------------------------------
+
+    due_match = re.search(
+        rf"\bDue\s*:\s*({MOODLE_DATETIME_PATTERN})",
+        page_text,
+        re.IGNORECASE
+    )
+
+    if due_match:
+
+        return due_match.group(1).strip()
+
+    # --------------------------------------------------------
+    # "Due date:"
+    # --------------------------------------------------------
+
+    due_date_match = re.search(
+        rf"\bDue\s+date\s*:\s*({MOODLE_DATETIME_PATTERN})",
+        page_text,
+        re.IGNORECASE
+    )
+
+    if due_date_match:
+
+        return due_date_match.group(1).strip()
+
+    return ""
+
+
+# ============================================================
+# Assignment description
+# ============================================================
+
+def extract_assignment_description(soup):
+    """
+    Extract the actual assignment description
+    from the assignment detail page.
+
+    Moodle normally stores the activity description
+    inside one of these containers.
+    """
+
+    # --------------------------------------------------------
+    # Preferred Moodle container
+    # --------------------------------------------------------
+
+    description_element = soup.select_one(
+        ".activity-description"
+    )
+
+    if description_element:
+
+        description = description_element.get_text(
+            " ",
+            strip=True
+        )
+
+        if description:
+
+            return description
+
+    # --------------------------------------------------------
+    # Fallback description container
+    # --------------------------------------------------------
+
+    description_element = soup.select_one(
+        ".description"
+    )
+
+    if description_element:
+
+        description = description_element.get_text(
+            " ",
+            strip=True
+        )
+
+        if description:
+
+            return description
+
+    return ""
+
+
+# ============================================================
+# Assignment detail page
+# ============================================================
+
+def get_assignment_page(assignment_url):
+    """
+    Open the actual Moodle assignment page
+    using the same logged-in Session.
+
+    This is important because Moodle requires
+    the authenticated session to expose the
+    assignment details.
+    """
+
+    response = request_with_relogin(
+        "GET",
+        assignment_url
+    )
+
+    if response is None:
+
+        return None
+
+    if response.status_code != 200:
+
+        print(
+            f"Could not open assignment: "
+            f"{response.status_code}"
+        )
+
+        return None
+
+    return BeautifulSoup(
+        response.text,
+        "html.parser"
+    )
+
+
+# ============================================================
+# Assignments
+# ============================================================
+
+def get_assignments(course_id):
+    """
+    Extract all assignments from a Moodle course.
+
+    Process:
+
+    1. Open the course page.
+    2. Find all assignment links.
+    3. Open each assignment detail page.
+    4. Extract the real Due Date.
+    5. Extract the real Description.
+
+    No assignment IDs or course IDs are hard-coded.
+    """
+
+    soup = get_course_page(
+        course_id
+    )
+
+    if soup is None:
+
+        return []
+
+    assignments = []
+
+    # --------------------------------------------------------
+    # Find assignment links from course page
+    # --------------------------------------------------------
+
+    assignment_links = soup.select(
+        'a[href*="/mod/assign/view.php"]'
+    )
+
+    seen_urls = set()
+
+    for link in assignment_links:
+
+        href = link.get("href")
+
+        if not href:
+
+            continue
+
+        # ----------------------------------------------------
+        # Moodle may return relative URLs.
+        # Convert them to absolute URLs.
+        # ----------------------------------------------------
+
+        if href.startswith("/"):
+
+            href = (
+                "https://elearning3.bau.edu.jo"
+                + href
+            )
+
+        elif href.startswith("mod/"):
+
+            href = (
+                f"{BASE_URL}/{href}"
+            )
+
+        # ----------------------------------------------------
+        # Avoid duplicate assignment links
+        # ----------------------------------------------------
+
+        if href in seen_urls:
+
+            continue
+
+        seen_urls.add(href)
+
+        # ----------------------------------------------------
+        # Assignment name
+        # ----------------------------------------------------
 
         name = link.get_text(
             " ",
             strip=True
         )
 
-        href = link.get(
-            "href"
-        )
-
-        if not name or not href:
-            continue
-
-        course_id = None
-
-        if "id=" in href:
-
-            try:
-
-                course_id = int(
-                    href.split(
-                        "id="
-                    )[1].split(
-                        "&"
-                    )[0]
-                )
-
-            except ValueError:
-
-                course_id = None
-
-        courses.append(
-            {
-                "id": course_id,
-                "name": name,
-                "url": href
-            }
-        )
-
-    print(
-        f"[DEBUG] Courses found: "
-        f"{len(courses)}"
-    )
-
-    return {
-        "status": "Success",
-        "courses": courses
-    }
-
-
-# =========================================================
-# GET ASSIGNMENTS
-# =========================================================
-
-def get_assignments(course_id):
-    """
-    Get assignments for a specific course.
-    """
-
-    print(
-        f"\n[DEBUG] Getting assignments "
-        f"for course ID: {course_id}"
-    )
-
-    course_html = get_cached_course_page(
-        course_id
-    )
-
-    if not course_html:
-
-        return {
-            "status": "Error",
-            "message": "Could not load course page."
-        }
-
-    soup = BeautifulSoup(
-        course_html,
-        "html.parser"
-    )
-
-    assignment_links = soup.select(
-        'a[href*="/mod/assign/view.php?id="]'
-    )
-
-    print(
-        f"[DEBUG] Assignment links found: "
-        f"{len(assignment_links)}"
-    )
-
-    assignments = []
-
-    seen_urls = set()
-
-    for link in assignment_links:
-
-        href = link.get(
-            "href"
-        )
-
-        if not href:
-            continue
-
-        if href in seen_urls:
-            continue
-
-        seen_urls.add(
-            href
-        )
-
-        print(
-            f"[DEBUG] Downloading assignment: "
-            f"{href}"
-        )
-
-        response = request_with_relogin(
-            "GET",
-            href
-        )
-
-        if response is None:
-
-            print(
-                "[ERROR] Could not download "
-                "assignment page."
-            )
-
-            continue
-
-        if response.status_code != 200:
-
-            print(
-                f"[ERROR] Assignment page returned "
-                f"status {response.status_code}"
-            )
-
-            continue
-
-        assignment_soup = BeautifulSoup(
-            response.text,
-            "html.parser"
-        )
-
-        # -------------------------------------------------
-        # Assignment name
-        # -------------------------------------------------
-
-        name = ""
-
-        heading = assignment_soup.find(
-            "h1"
-        )
-
-        if heading:
-
-            name = heading.get_text(
-                " ",
-                strip=True
-            )
-
         if not name:
 
-            name = link.get_text(
-                " ",
-                strip=True
-            )
+            continue
 
-        # -------------------------------------------------
-        # Description
-        # -------------------------------------------------
-
-        description = ""
-
-        description_element = (
-            assignment_soup.select_one(
-                ".activity-description"
-            )
+        print(
+            f"  Reading assignment: "
+            f"{name}"
         )
 
-        if description_element:
+        # ----------------------------------------------------
+        # Open actual assignment page
+        # ----------------------------------------------------
 
-            description = (
-                description_element.get_text(
-                    " ",
-                    strip=True
-                )
-            )
-
-        # -------------------------------------------------
-        # Due date
-        # -------------------------------------------------
-
-        due_date = ""
-
-        page_text = assignment_soup.get_text(
-            " ",
-            strip=True
+        assignment_soup = get_assignment_page(
+            href
         )
 
-        due_marker = "Due date"
+        if assignment_soup is None:
 
-        if due_marker.lower() in page_text.lower():
-
-            lower_text = page_text.lower()
-
-            index = lower_text.find(
-                due_marker.lower()
+            print(
+                "    Could not read assignment page."
             )
 
-            if index != -1:
+            assignments.append(
+                {
+                    "name": name,
+                    "url": href,
+                    "description": "",
+                    "due_date": "",
+                }
+            )
 
-                due_date = page_text[
-                    index:index + 150
-                ]
+            continue
+
+        # ----------------------------------------------------
+        # Extract real Due Date
+        # ----------------------------------------------------
+
+        due_date = extract_assignment_due_date(
+            assignment_soup
+        )
+
+        # ----------------------------------------------------
+        # Extract real Description
+        # ----------------------------------------------------
+
+        description = (
+            extract_assignment_description(
+                assignment_soup
+            )
+        )
 
         assignments.append(
             {
                 "name": name,
                 "url": href,
                 "description": description,
-                "due_date": due_date
+                "due_date": due_date,
             }
         )
 
-    print(
-        f"[DEBUG] Assignments collected: "
-        f"{len(assignments)}"
+    return assignments
+
+
+# ============================================================
+# Quiz information
+# ============================================================
+
+def extract_quiz_info(soup):
+    """
+    Extract quiz metadata from a Moodle quiz page.
+
+    Dates are extracted using the exact Moodle
+    datetime format so descriptions cannot leak
+    into date fields.
+    """
+
+    page_text = soup.get_text(
+        " ",
+        strip=True
     )
 
+    opened_date = ""
+    closed_date = ""
+    attempts_allowed = ""
+    time_limit = ""
+
+    # --------------------------------------------------------
+    # Opened
+    # --------------------------------------------------------
+
+    opened_match = re.search(
+        rf"\bOpened\s*:\s*({MOODLE_DATETIME_PATTERN})",
+        page_text,
+        re.IGNORECASE
+    )
+
+    if opened_match:
+
+        opened_date = (
+            opened_match.group(1).strip()
+        )
+
+    # --------------------------------------------------------
+    # Closed
+    # --------------------------------------------------------
+
+    closed_match = re.search(
+        rf"\bClosed\s*:\s*({MOODLE_DATETIME_PATTERN})",
+        page_text,
+        re.IGNORECASE
+    )
+
+    if closed_match:
+
+        closed_date = (
+            closed_match.group(1).strip()
+        )
+
+    # --------------------------------------------------------
+    # Attempts allowed
+    # --------------------------------------------------------
+
+    attempts_match = re.search(
+        r"\bAttempts allowed\s*:\s*(.*?)(?=\s+Time limit\s*:)",
+        page_text,
+        re.IGNORECASE
+    )
+
+    if attempts_match:
+
+        attempts_allowed = (
+            attempts_match.group(1)
+            .strip()
+        )
+
+    # --------------------------------------------------------
+    # Time limit
+    # --------------------------------------------------------
+
+    time_limit_match = re.search(
+        r"\bTime limit\s*:\s*(.*?)(?=\s+(?:Your attempts|Your final|Grade|Back to the course|$))",
+        page_text,
+        re.IGNORECASE
+    )
+
+    if time_limit_match:
+
+        time_limit = (
+            time_limit_match.group(1)
+            .strip()
+        )
+
     return {
-        "status": "Success",
-        "course_id": course_id,
-        "assignments": assignments
+        "opened_date": opened_date,
+        "closed_date": closed_date,
+        "attempts_allowed": attempts_allowed,
+        "time_limit": time_limit,
     }
 
 
-# =========================================================
-# GET QUIZZES
-# =========================================================
+# ============================================================
+# Quiz description
+# ============================================================
+
+def extract_quiz_description(soup):
+    """
+    Extract the quiz description.
+
+    Prefer Moodle's activity-description
+    container.
+    """
+
+    description_element = soup.select_one(
+        ".activity-description"
+    )
+
+    if description_element:
+
+        description = (
+            description_element.get_text(
+                " ",
+                strip=True
+            )
+        )
+
+        if description:
+
+            return description
+
+    description_element = soup.select_one(
+        ".description"
+    )
+
+    if description_element:
+
+        description = (
+            description_element.get_text(
+                " ",
+                strip=True
+            )
+        )
+
+        if description:
+
+            return description
+
+    return ""
+
+
+# ============================================================
+# Quizzes
+# ============================================================
 
 def get_quizzes(course_id):
     """
-    Get quizzes for a specific course.
+    Extract all quizzes from a Moodle course.
     """
 
-    print(
-        f"\n[DEBUG] Getting quizzes "
-        f"for course ID: {course_id}"
-    )
-
-    course_html = get_cached_course_page(
+    soup = get_course_page(
         course_id
     )
 
-    if not course_html:
+    if soup is None:
 
-        return {
-            "status": "Error",
-            "message": "Could not load course page."
-        }
-
-    soup = BeautifulSoup(
-        course_html,
-        "html.parser"
-    )
-
-    quiz_links = soup.select(
-        'a[href*="/mod/quiz/view.php?id="]'
-    )
-
-    print(
-        f"[DEBUG] Quiz links found: "
-        f"{len(quiz_links)}"
-    )
+        return []
 
     quizzes = []
+
+    quiz_links = soup.select(
+        'a[href*="/mod/quiz/view.php"]'
+    )
 
     seen_urls = set()
 
     for link in quiz_links:
 
-        href = link.get(
-            "href"
-        )
+        href = link.get("href")
 
         if not href:
+
             continue
+
+        # ----------------------------------------------------
+        # Convert relative URL to absolute URL
+        # ----------------------------------------------------
+
+        if href.startswith("/"):
+
+            href = (
+                "https://elearning3.bau.edu.jo"
+                + href
+            )
+
+        elif href.startswith("mod/"):
+
+            href = (
+                f"{BASE_URL}/{href}"
+            )
+
+        # ----------------------------------------------------
+        # Avoid duplicates
+        # ----------------------------------------------------
 
         if href in seen_urls:
-            continue
-
-        seen_urls.add(
-            href
-        )
-
-        print(
-            f"[DEBUG] Downloading quiz: "
-            f"{href}"
-        )
-
-        response = request_with_relogin(
-            "GET",
-            href
-        )
-
-        if response is None:
-
-            print(
-                "[ERROR] Could not download "
-                "quiz page."
-            )
 
             continue
 
-        if response.status_code != 200:
+        seen_urls.add(href)
 
-            print(
-                f"[ERROR] Quiz page returned "
-                f"status {response.status_code}"
-            )
-
-            continue
-
-        quiz_soup = BeautifulSoup(
-            response.text,
-            "html.parser"
-        )
-
-        # -------------------------------------------------
-        # Quiz name
-        # -------------------------------------------------
-
-        name = ""
-
-        heading = quiz_soup.find(
-            "h1"
-        )
-
-        if heading:
-
-            name = heading.get_text(
-                " ",
-                strip=True
-            )
-
-        if not name:
-
-            name = link.get_text(
-                " ",
-                strip=True
-            )
-
-        # -------------------------------------------------
-        # Description
-        # -------------------------------------------------
-
-        description = ""
-
-        description_element = (
-            quiz_soup.select_one(
-                ".activity-description"
-            )
-        )
-
-        if description_element:
-
-            description = (
-                description_element.get_text(
-                    " ",
-                    strip=True
-                )
-            )
-
-        # -------------------------------------------------
-        # Close date
-        # -------------------------------------------------
-
-        close_date = ""
-
-        page_text = quiz_soup.get_text(
+        name = link.get_text(
             " ",
             strip=True
         )
 
-        close_marker = "Close the quiz"
+        if not name:
 
-        if close_marker.lower() in page_text.lower():
+            continue
 
-            lower_text = page_text.lower()
+        # ----------------------------------------------------
+        # Extract quiz ID
+        # ----------------------------------------------------
 
-            index = lower_text.find(
-                close_marker.lower()
+        quiz_id_match = re.search(
+            r"[?&]id=(\d+)",
+            href
+        )
+
+        quiz_id = None
+
+        if quiz_id_match:
+
+            quiz_id = quiz_id_match.group(1)
+
+        # ----------------------------------------------------
+        # Open actual quiz page
+        # ----------------------------------------------------
+
+        quiz_soup = soup
+
+        if quiz_id:
+
+            quiz_url = (
+                f"{BASE_URL}/mod/quiz/view.php"
+                f"?id={quiz_id}"
             )
 
-            if index != -1:
+            response = request_with_relogin(
+                "GET",
+                quiz_url
+            )
 
-                close_date = page_text[
-                    index:index + 150
-                ]
+            if (
+                response is not None
+                and response.status_code == 200
+            ):
+
+                quiz_soup = BeautifulSoup(
+                    response.text,
+                    "html.parser"
+                )
+
+        # ----------------------------------------------------
+        # Extract quiz information
+        # ----------------------------------------------------
+
+        quiz_info = extract_quiz_info(
+            quiz_soup
+        )
+
+        description = (
+            extract_quiz_description(
+                quiz_soup
+            )
+        )
 
         quizzes.append(
             {
                 "name": name,
                 "url": href,
                 "description": description,
-                "close_date": close_date
+                **quiz_info,
             }
         )
 
-    print(
-        f"[DEBUG] Quizzes collected: "
-        f"{len(quizzes)}"
-    )
-
-    return {
-        "status": "Success",
-        "course_id": course_id,
-        "quizzes": quizzes
-    }
+    return quizzes
 
 
-# =========================================================
-# MAIN TEST
-# =========================================================
+# ============================================================
+# Main test
+# ============================================================
 
 if __name__ == "__main__":
 
-    print(
-        "Testing BAU Moodle assignments..."
-    )
+    print("=" * 60)
+    print("BAU Moodle LMS Client Test")
+    print("=" * 60)
 
-    result = get_courses()
+    if not login():
 
-    print(
-        result
-    )
-
-    if result.get("status") == "Success":
-
-        courses = result.get(
-            "courses",
-            []
+        print(
+            "\nLogin failed ❌"
         )
 
-        if courses:
+        raise SystemExit(1)
 
-            first_course = courses[0]
+    print(
+        "\nGetting enrolled courses..."
+    )
 
-            course_id = first_course.get(
-                "id"
-            )
+    courses = get_courses()
+
+    print(
+        f"\nFound {len(courses)} course(s):"
+    )
+
+    for index, course in enumerate(
+        courses,
+        start=1
+    ):
+
+        print(
+            f"{index}. "
+            f"ID {course['id']} - "
+            f"{course['name']}"
+        )
+
+    print(
+        "\n" + "=" * 60
+    )
+
+    for course in courses:
+
+        course_id = course["id"]
+        course_name = course["name"]
+
+        print(
+            f"\nCOURSE: {course_name}"
+        )
+
+        print(
+            f"COURSE ID: {course_id}"
+        )
+
+        print(
+            "-" * 60
+        )
+
+        # ----------------------------------------------------
+        # Assignments
+        # ----------------------------------------------------
+
+        print(
+            "\nAssignments:"
+        )
+
+        assignments = get_assignments(
+            course_id
+        )
+
+        if not assignments:
 
             print(
-                f"\nTesting assignments "
-                f"for: {first_course.get('name')}"
+                "No assignments found."
             )
 
-            assignments_result = get_assignments(
-                course_id
-            )
+        else:
+
+            for index, assignment in enumerate(
+                assignments,
+                start=1
+            ):
+
+                print(
+                    f"\nAssignment {index}:"
+                )
+
+                print(
+                    f"Name: "
+                    f"{assignment['name']}"
+                )
+
+                print(
+                    f"Due: "
+                    f"{assignment['due_date']}"
+                )
+
+                print(
+                    f"URL: "
+                    f"{assignment['url']}"
+                )
+
+                print(
+                    f"Description: "
+                    f"{assignment['description']}"
+                )
+
+        # ----------------------------------------------------
+        # Quizzes
+        # ----------------------------------------------------
+
+        print(
+            "\nQuizzes:"
+        )
+
+        quizzes = get_quizzes(
+            course_id
+        )
+
+        if not quizzes:
 
             print(
-                assignments_result
+                "No quizzes found."
             )
+
+        else:
+
+            for index, quiz in enumerate(
+                quizzes,
+                start=1
+            ):
+
+                print(
+                    f"\nQuiz {index}:"
+                )
+
+                print(
+                    f"Name: "
+                    f"{quiz['name']}"
+                )
+
+                print(
+                    f"Opened: "
+                    f"{quiz['opened_date']}"
+                )
+
+                print(
+                    f"Closed: "
+                    f"{quiz['closed_date']}"
+                )
+
+                print(
+                    f"Attempts allowed: "
+                    f"{quiz['attempts_allowed']}"
+                )
+
+                print(
+                    f"Time limit: "
+                    f"{quiz['time_limit']}"
+                )
+
+                print(
+                    f"Description: "
+                    f"{quiz['description']}"
+                )
+
+                print(
+                    f"URL: "
+                    f"{quiz['url']}"
+                )
+
+    print(
+        "\n" + "=" * 60
+    )
+
+    print(
+        "Test completed."
+    )
+
+    print(
+        "=" * 60
+    )

@@ -1,3 +1,30 @@
+# Environment / secrets
 .env
-__pycache__/
 .venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Local agent state / generated data
+course_aliases.json
+course_semantic_index.json
+monitor_snapshot.json
+action_log.txt
+
+# Debug HTML files
+bau_home.html
+block_myoverview_main.js
+debug_assignment.html
+debug_assignment_pretty.html
+elearning3_test.html
+my_courses_debug.html
+my_courses_page_debug.html
+moodle_dashboard.html
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
