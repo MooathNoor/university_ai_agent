@@ -10,6 +10,8 @@ from lms_client import (
     session,
     BASE_URL,
     get_courses,
+    get_assignments as get_course_assignments,
+    get_quizzes as get_course_quizzes,
 )
 
 from moodle_tools import (
@@ -637,71 +639,43 @@ def find_course(course_name, courses):
 # ============================================================
 
 def get_assignments(course_name=None):
-    """
-    Return real Moodle assignments.
+    """Return real Moodle assignments.
 
-    If course_name is provided, return assignments only
-    from that course.
+    A single-course request goes directly to that Moodle course page instead of
+    scanning every enrolled course first. Cross-course callers can still omit
+    ``course_name`` and use the existing aggregate loader.
     """
-
     if not login():
         return {
             "status": "Error",
             "message": "Could not authenticate with Moodle."
         }
 
-    assignments = get_all_assignments()
-
-    if assignments is None:
-        return []
-
     if not course_name:
-        return assignments
+        assignments = get_all_assignments()
+        return [] if assignments is None else assignments
 
     courses = get_cached_courses()
-
-    target_course = find_course(
-        course_name,
-        courses
-    )
-
+    target_course = find_course(course_name, courses)
     if target_course is None:
         return {
             "status": "Unknown",
             "message": f"Course '{course_name}' was not found."
         }
 
-    real_course_name = get_course_name(
-        target_course
-    )
-
-    course_id = get_course_id(
-        target_course
-    )
+    real_course_name = get_course_name(target_course)
+    course_id = get_course_id(target_course)
+    assignments = get_course_assignments(course_id) or []
 
     result = []
-
     for assignment in assignments:
-
-        assignment_course_id = (
-            assignment.get("course_id")
-        )
-
-        assignment_course_name = (
-            assignment.get("course_name", "")
-        )
-
-        if (
-            assignment_course_id == course_id
-            or assignment_course_name == real_course_name
-        ):
-            item = dict(assignment)
-
-            item["course"] = real_course_name
-            item["course_id"] = course_id
-
-            result.append(item)
-
+        if not isinstance(assignment, dict):
+            continue
+        item = dict(assignment)
+        item["course_name"] = real_course_name
+        item["course"] = real_course_name
+        item["course_id"] = course_id
+        result.append(item)
     return result
 
 
@@ -710,69 +684,42 @@ def get_assignments(course_name=None):
 # ============================================================
 
 def get_quizzes(course_name=None):
-    """
-    Return real Moodle quizzes.
+    """Return real Moodle quizzes.
 
-    If course_name is provided, return quizzes only
-    from that course.
+    A single-course request goes directly to that Moodle course page. Omitting
+    ``course_name`` preserves the existing all-course aggregate behavior.
     """
-
     if not login():
         return {
             "status": "Error",
             "message": "Could not authenticate with Moodle."
         }
 
-    quizzes = get_all_quizzes()
-
-    if quizzes is None:
-        return []
-
     if not course_name:
-        return quizzes
+        quizzes = get_all_quizzes()
+        return [] if quizzes is None else quizzes
 
     courses = get_cached_courses()
-
-    target_course = find_course(
-        course_name,
-        courses
-    )
-
+    target_course = find_course(course_name, courses)
     if target_course is None:
         return {
             "status": "Unknown",
             "message": f"Course '{course_name}' was not found."
         }
 
-    real_course_name = get_course_name(
-        target_course
-    )
-
-    course_id = get_course_id(
-        target_course
-    )
+    real_course_name = get_course_name(target_course)
+    course_id = get_course_id(target_course)
+    quizzes = get_course_quizzes(course_id) or []
 
     result = []
-
     for quiz in quizzes:
-
-        quiz_course_id = quiz.get("course_id")
-        quiz_course_name = quiz.get(
-            "course_name",
-            ""
-        )
-
-        if (
-            quiz_course_id == course_id
-            or quiz_course_name == real_course_name
-        ):
-            item = dict(quiz)
-
-            item["course"] = real_course_name
-            item["course_id"] = course_id
-
-            result.append(item)
-
+        if not isinstance(quiz, dict):
+            continue
+        item = dict(quiz)
+        item["course_name"] = real_course_name
+        item["course"] = real_course_name
+        item["course_id"] = course_id
+        result.append(item)
     return result
 
 

@@ -32,7 +32,7 @@ QUIZZES = {
     ROBOT: [
         {"name": "Quiz1", "url": "https://x/mod/quiz/view.php?id=3"},
         {"name": "Quiz 2", "url": "https://x/mod/quiz/view.php?id=4"},
-        {"name": "Quiz 3", "url": "https://x/mod/quiz/view.php?id=5"},
+        {"name": "Quiz 3", "url": "https://x/mod/quiz/view.php?id=5", "time_limit": "5 mins", "attempts_allowed": "1"},
     ],
 }
 
@@ -45,7 +45,9 @@ ASSIGNMENTS = {
         {"name": "17/8/2026 Assignment", "due_date": "Thursday, 20 August 2026, 8:00 PM", "description": "solve example 3 in unit 6 derivation الحل بخط اليد فقط", "url": "https://x/mod/assign/view.php?id=15"},
     ],
     CLOUD: [
-        {"name": "Cloud Security Assignment", "due_date": "Sunday, 23 August 2026, 12:00 AM", "description": "Discuss cloud security", "url": "https://x/mod/assign/view.php?id=21"},
+        {"name": "Public vs Private Assignment", "due_date": "Tuesday, 21 July 2026, 12:00 AM", "description": "Compare public and private cloud", "url": "https://x/mod/assign/view.php?id=20"},
+        {"name": "Virtualization Assignment", "due_date": "Tuesday, 28 July 2026, 12:00 AM", "description": "Divide 16 GB RAM and 8 CPU cores equally across 4 virtual machines", "url": "https://x/mod/assign/view.php?id=21"},
+        {"name": "Cloud Security Assignment", "due_date": "Sunday, 23 August 2026, 12:00 AM", "description": "Discuss cloud security", "url": "https://x/mod/assign/view.php?id=22"},
     ],
     ROBOT: [],
 }
@@ -130,6 +132,8 @@ def load_agent():
     temp_dir = tempfile.mkdtemp()
     module.COURSE_SEMANTIC_INDEX_FILE = os.path.join(temp_dir, "course_semantic_index.json")
     module.LEARNED_RULES_FILE = os.path.join(temp_dir, "agent_learned_rules.json")
+    module._event_state.path = os.path.join(temp_dir, "agent_event_state.json")
+    module._event_state.reset()
     module._course_index_cache = {"fingerprint": None, "profiles": None}
     module.clear_context()
     return module
@@ -335,6 +339,17 @@ def run():
     # Consume the waiting state safely so later tests are independent.
     m.process_user_message("خلي ردودك مرتبه")
 
+
+    # Resource ordinal follow-up must stay local and reuse the grounded list.
+    m.clear_context()
+    rr = m.process_user_message("اعطيني ملفات ماده التحليل العددي")
+    check("Unit 6.pdf" in rr, f"resource setup for first-file follow-up failed: {rr}")
+    rr = m.process_user_message("هات اول ملف فقط")
+    check("Unit 6.pdf" in rr and "Lecture meeting" not in rr, f"first-file follow-up escaped context: {rr}")
+
+    # Asking whether something is new/current must force a real refresh rather than
+    # silently trusting a potentially stale course-workspace cache.
+    check(m._force_refresh_requested("في واجب جديد حاليا؟"), "new assignment question did not request refresh")
     # "آخر ملف بس" must refine the already grounded resource result instead of
     # becoming course_info / a giant course-page response.
     m.clear_context()
@@ -389,7 +404,108 @@ def run():
     rr = m.process_user_message("هل المطلوب انو اكتب الواجب بخط اليد؟")
     check("بخط اليد فقط" in rr, f"natural handwriting question failed: {rr}")
 
-    print("PASS: 90 regression assertions")
+    # Dynamic course workspace: ordinal selection must be applied exactly once.
+    m.clear_context()
+    rr = m.process_user_message("بدي الواجب الثاني لمادة الحوسبة السحابيه")
+    check("Virtualization Assignment" in rr, f"second Cloud assignment failed: {rr}")
+    check("Public vs Private" not in rr and "Cloud Security" not in rr, f"ordinal selection returned extra assignments: {rr}")
+    check(str(m._conversation_state["active_course"]["id"]) == "1194", "ordinal selection lost Cloud context")
+
+    # A direct follow-up about the selected assignment file must stay on the
+    # grounded assignment and must never create a course-clarification alias.
+    rr = m.process_user_message("طيب هات الملف الي معتمد على الواجب")
+    check("رابط صفحة الواجب" in rr or "مرفقات" in rr or "ملفات" in rr, f"assignment-file follow-up escaped context: {rr}")
+    check(m._pending_course_resolution is None, "assignment-file follow-up incorrectly started course clarification")
+
+    # Monitoring capability is a local capability answer, not a live Moodle query.
+    m.clear_context()
+    rr = m.process_user_message("بتقدر تخبرني بكل تحديث بصير مثل ادا نزل واجب او كويز او تفعل الحضور؟")
+    check("monitor" in rr.lower() or "التنبيه" in rr, f"monitoring capability did not use local fast path: {rr}")
+    check(m._pending_course_resolution is None, "monitoring capability created course clarification")
+
+    # Full real-world dialogue: list -> ordinal selection -> natural details.
+    # These turns must remain entirely in grounded state and must never invoke
+    # the course scorer or learn conversational predicates as course aliases.
+    m.clear_context()
+    rr = m.process_user_message("هات قائمة الواجبات لمادة التحليل العددي")
+    check("13/7/2026 Assignment" in rr and "17/8/2026 Assignment" in rr, f"Numerical list setup failed: {rr}")
+    rr = m.process_user_message("بدي ترسل ثالث واجب")
+    check("26-7-2026 Assignment" in rr, f"state-first third assignment selection failed: {rr}")
+    check(m._pending_course_resolution is None, "ordinal follow-up triggered course clarification")
+    check(m._active_entity_item("assignment").get("name") == "26-7-2026 Assignment", "third assignment was not grounded as active entity")
+    rr = m.process_user_message("شو بده ؟")
+    check("solve example 3" in rr, f"short predicate assignment follow-up failed: {rr}")
+    rr = m.process_user_message("اشرحلي الواجب شو بده ؟")
+    check("solve example 3" in rr, f"natural assignment explanation follow-up failed: {rr}")
+    learned_phrases = {m.normalize_text(rule.get("phrase")) for rule in m._load_learned_rules().get("rules", [])}
+    check("ترسل ثالث" not in learned_phrases and "بده" not in learned_phrases, f"generic follow-up polluted course aliases: {learned_phrases}")
+
+    # Simple greetings are pure conversation controls: no Moodle and no Ollama.
+    m.clear_context()
+    rr = m.process_user_message("مساء الخير")
+    check("مرحبا" in rr, f"simple greeting did not use fast local path: {rr}")
+
+    # High-confidence future watches must bypass Ollama completely.  The semantic
+    # layer should compile assignment + course + notification into a structured
+    # pending action even when the local planner is unavailable.
+    m.clear_context()
+    original_chat = m.ollama.chat
+    def _watch_must_not_call_ollama(*args, **kwargs):
+        raise AssertionError("Ollama should not be called for a high-confidence future watch")
+    m.ollama.chat = _watch_must_not_call_ollama
+    try:
+        rr = m.process_user_message("لو الدكتور نزل واجب جديد بالحوسبة السحابية بلغني مباشرة")
+    finally:
+        m.ollama.chat = original_chat
+    check("حفظت الطلب" in rr, f"future assignment watch was not registered deterministically: {rr}")
+    snapshot = m.get_event_state_snapshot()
+    pending = snapshot.get("pending_actions", [])
+    check(
+        any(
+            item.get("trigger_type") == "assignment_added"
+            and str((item.get("filters") or {}).get("course_id")) == "1194"
+            for item in pending
+        ),
+        f"future assignment watch was not canonicalized to Cloud course 1194: {pending}",
+    )
+
+    # Submission-state requests are a distinct cross-course intent. They must go
+    # to pending_work directly instead of running assignments/quizzes separately.
+    m.clear_context()
+    rr = m.process_user_message("طيب بدي تروح تتاكد ادا في واجب او كويز لم يتم تسليمه")
+    check(rr.startswith("لا"), f"pending submission mixed request did not route to pending_work: {rr}")
+    check(m._conversation_state.get("last_intent") == "pending_work", "pending submission request did not save pending_work intent")
+    rr = m.process_user_message("بدي منك تروح تتاكد من جميع المواد ادا في واجبات لم يتم تسليمها")
+    check(rr.startswith("لا"), f"all-course unsubmitted assignment request did not route to pending_work: {rr}")
+
+    # Short factual pending-work follow-ups remain deterministic. Open-ended
+    # advice/choice wording is covered by the end-to-end LLM-reasoner scenarios.
+    rr = m.process_user_message("شو ضايل علي")
+    check(rr.startswith("لا"), f"factual pending-work follow-up escaped state: {rr}")
+
+    # Discourse marker 'خلص' means 'leave that topic' here, not completed/past.
+    m.clear_context()
+    rr = m.process_user_message("خلص اترك هاض هسا هات كويزات الروبتات")
+    check("Quiz 3" in rr, f"topic-switch 'خلص' incorrectly filtered completed quizzes: {rr}")
+    rr = m.process_user_message("طيب اخر كويز شو كان؟")
+    check("Quiz 3" in rr, f"last quiz selection failed after topic switch: {rr}")
+    rr = m.process_user_message("كم كانت مدته؟")
+    check("5 mins" in rr, f"selected quiz duration did not stay in state: {rr}")
+
+    # An explicit course mention must outrank a stale resource result set.
+    m.clear_context()
+    rr = m.process_user_message("هات ملفات مادة التحليل العددي")
+    check("Unit 6.pdf" in rr, f"resource setup failed: {rr}")
+    rr = m.process_user_message("اول ملف من مادة الحوسبة")
+    check("Unit 6.pdf" not in rr, f"stale Numerical resource hijacked explicit Cloud request: {rr}")
+    check(str(m._conversation_state["active_course"]["id"]) == "1194", "explicit Cloud resource request did not switch active course")
+
+    # Narrow course-info questions must never dump the whole course payload or
+    # fabricate fields the current tool does not extract.
+    rr = m.process_user_message("مين الدكتور تبع مادة الحوسبة السحابيه شو اسمه")
+    check("مش موجود ضمن البيانات" in rr, f"missing instructor was not reported honestly: {rr}")
+
+    print("PASS: 118 regression assertions")
 
 
 if __name__ == "__main__":

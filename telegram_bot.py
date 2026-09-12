@@ -1,10 +1,15 @@
 import os
+import queue
+import threading
 import time
 
 import requests
 from dotenv import load_dotenv
 
-from main import process_user_message
+from main import (
+    get_fast_conversation_response,
+    process_user_message,
+)
 
 
 # ============================================================
@@ -28,6 +33,17 @@ POLLING_DELAY = 1
 # safety margin so future formatting/escaping changes do not push a chunk over
 # the limit.
 TELEGRAM_SAFE_MESSAGE_LENGTH = 3800
+
+
+# ============================================================
+# BACKGROUND PROCESSING QUEUE
+# ============================================================
+
+# Heavy agent turns are processed sequentially in one worker so conversation
+# state remains ordered and race-free. The polling loop stays free to receive
+# new Telegram updates while that worker is busy.
+_MESSAGE_QUEUE = queue.Queue()
+_WORKER_STOP = object()
 
 
 # ============================================================
@@ -171,29 +187,32 @@ def get_updates(offset=None):
 
 
 # ============================================================
-# PROCESS TELEGRAM MESSAGE
+# UPDATE HELPERS
 # ============================================================
 
-def process_telegram_message(update):
-    """Process one Telegram update and send the agent's final response."""
-
+def _extract_text_message(update):
+    """Return (chat_id, text) for a normal text message, otherwise (None, None)."""
     message = update.get("message")
     if not message:
-        return
+        return None, None
 
     chat = message.get("chat")
     if not chat:
-        return
+        return None, None
 
     chat_id = chat.get("id")
     text = message.get("text")
-    if not text:
-        return
+    if chat_id is None or not text:
+        return None, None
 
     text = text.strip()
     if not text:
-        return
+        return None, None
 
+    return chat_id, text
+
+
+def _print_incoming(chat_id, text):
     print("\n")
     print("=" * 70)
     print("NEW TELEGRAM MESSAGE")
@@ -201,6 +220,20 @@ def process_telegram_message(update):
     print(f"Chat ID: {chat_id}")
     print(f"User message: {text}")
     print("=" * 70)
+
+
+# ============================================================
+# PROCESS TELEGRAM MESSAGE
+# ============================================================
+
+def process_telegram_message(update):
+    """Process one queued Telegram update and send the agent's final response."""
+
+    chat_id, text = _extract_text_message(update)
+    if chat_id is None:
+        return
+
+    _print_incoming(chat_id, text)
 
     # --------------------------------------------------------
     # Special commands
@@ -257,6 +290,67 @@ def process_telegram_message(update):
 
 
 # ============================================================
+# BACKGROUND WORKER
+# ============================================================
+
+def _message_worker():
+    """Process heavy/user-stateful messages in arrival order."""
+    while True:
+        update = _MESSAGE_QUEUE.get()
+        try:
+            if update is _WORKER_STOP:
+                return
+            process_telegram_message(update)
+        except Exception as error:
+            print(f"[TELEGRAM] Worker error: {error}")
+        finally:
+            _MESSAGE_QUEUE.task_done()
+
+
+def _start_message_worker():
+    worker = threading.Thread(
+        target=_message_worker,
+        name="telegram-agent-worker",
+        daemon=True,
+    )
+    worker.start()
+    return worker
+
+
+def _try_fast_response(update):
+    """Reply immediately to side-effect-free social/control turns.
+
+    This runs in the polling thread, so a greeting such as "مساء الخير" can be
+    answered even while the background agent worker is handling a slow Moodle or
+    local-LLM request. Stateful university turns are never handled here.
+    """
+    chat_id, text = _extract_text_message(update)
+    if chat_id is None:
+        return False
+
+    if text.lower() in {"/start", "/help"}:
+        return False
+
+    try:
+        response_text = get_fast_conversation_response(text)
+    except Exception as error:
+        print(f"[TELEGRAM] Fast-response check failed: {error}")
+        return False
+
+    if response_text is None:
+        return False
+
+    _print_incoming(chat_id, text)
+    print("[TELEGRAM] Fast local response (no Moodle/Ollama).")
+    success = send_long_message(chat_id, response_text)
+    if success:
+        print("[TELEGRAM] Fast response sent successfully.")
+    else:
+        print("[TELEGRAM] Fast response failed.")
+    return True
+
+
+# ============================================================
 # START BOT
 # ============================================================
 
@@ -279,30 +373,43 @@ def start_bot():
     print("Press Ctrl+C to stop the bot.")
     print("=" * 70)
 
+    worker = _start_message_worker()
     offset = None
 
-    while True:
-        try:
-            updates = get_updates(offset)
+    try:
+        while True:
+            try:
+                updates = get_updates(offset)
 
-            for update in updates:
-                update_id = update.get("update_id")
-                if update_id is not None:
-                    offset = update_id + 1
+                for update in updates:
+                    update_id = update.get("update_id")
+                    if update_id is not None:
+                        offset = update_id + 1
 
-                process_telegram_message(update)
+                    # Social/control messages can be answered immediately even
+                    # while one heavy agent turn is running in the worker.
+                    if _try_fast_response(update):
+                        continue
 
-        except KeyboardInterrupt:
-            print("\n")
-            print("=" * 70)
-            print("Telegram bot stopped.")
-            print("=" * 70)
-            break
+                    _MESSAGE_QUEUE.put(update)
 
-        except Exception as error:
-            print(f"\n[TELEGRAM] Unexpected error: {error}")
-            print("Bot will continue running...")
-            time.sleep(POLLING_DELAY)
+            except KeyboardInterrupt:
+                raise
+
+            except Exception as error:
+                print(f"\n[TELEGRAM] Unexpected polling error: {error}")
+                print("Bot will continue running...")
+                time.sleep(POLLING_DELAY)
+
+    except KeyboardInterrupt:
+        print("\n")
+        print("=" * 70)
+        print("Telegram bot stopped.")
+        print("=" * 70)
+
+    finally:
+        _MESSAGE_QUEUE.put(_WORKER_STOP)
+        worker.join(timeout=2)
 
 
 # ============================================================

@@ -7,6 +7,7 @@ from datetime import datetime
 import tools
 
 from notification import send_notification
+from event_state import EventState
 
 from tools import (
     get_my_courses,
@@ -49,6 +50,7 @@ DEDUP_WINDOW_SECONDS = 86400
 # ============================================================
 
 _course_cache = None
+_event_state = EventState()
 
 
 def get_cached_courses():
@@ -109,6 +111,152 @@ def reset_course_cache():
     global _course_cache
 
     _course_cache = None
+
+
+def get_course_identity(course_name):
+    """Return stable Moodle course identity for an event payload."""
+
+    if not course_name:
+        return {
+            "course_id": None,
+            "course_name": course_name
+        }
+
+    courses = get_cached_courses()
+
+    if not isinstance(courses, list):
+        return {
+            "course_id": None,
+            "course_name": course_name
+        }
+
+    normalized = str(course_name).strip().lower()
+
+    # Prefer exact Moodle name equality.
+    for course in courses:
+        real_name = str(course.get("name") or "").strip()
+        if real_name.lower() == normalized:
+            return {
+                "course_id": course.get("id"),
+                "course_name": real_name or course_name
+            }
+
+    # Fall back to conservative phrase matching.
+    for course in courses:
+        real_name = str(course.get("name") or "").strip()
+        real_lower = real_name.lower()
+
+        if normalized and (
+            normalized in real_lower
+            or real_lower in normalized
+        ):
+            return {
+                "course_id": course.get("id"),
+                "course_name": real_name or course_name
+            }
+
+    return {
+        "course_id": None,
+        "course_name": course_name
+    }
+
+
+def record_agent_event(event_type, payload):
+    """Persist one monitor event and return matching pending actions.
+
+    The shared EventState is refreshed from disk, so pending actions created by
+    the Telegram process can be matched here even when monitor.py runs in a
+    separate process.
+    """
+
+    try:
+        result = _event_state.record_event(
+            event_type,
+            payload or {}
+        )
+
+        event = result.get("event", {})
+        matches = result.get("matching_actions", [])
+
+        print(
+            f"\n[EVENT STATE] Recorded {event_type} "
+            f"as {event.get('id')}. "
+            f"Matching pending actions: {len(matches)}"
+        )
+
+        return result
+
+    except Exception as error:
+        # Event-state persistence must not stop Moodle monitoring.
+        print(
+            f"\n[EVENT STATE] Could not record "
+            f"{event_type}: {error}"
+        )
+
+        return {
+            "event": None,
+            "matching_actions": []
+        }
+
+
+def pending_action_note(event_result):
+    """Build a short note when a detected event matches saved user requests."""
+
+    matches = (event_result or {}).get(
+        "matching_actions",
+        []
+    )
+
+    if not matches:
+        return ""
+
+    readable_requests = []
+
+    for action in matches:
+        if not action.get("notify", True):
+            continue
+
+        original = str(
+            action.get("original_request") or ""
+        ).strip()
+
+        if original:
+            readable_requests.append(original)
+
+    if not readable_requests:
+        return (
+            "\n\n✅ This event matched a saved pending action."
+        )
+
+    unique_requests = list(dict.fromkeys(readable_requests))
+    lines = [
+        "",
+        "✅ This event matched your saved request:"
+    ]
+
+    for request in unique_requests[:3]:
+        lines.append(f"- {request}")
+
+    if len(unique_requests) > 3:
+        lines.append(
+            f"- +{len(unique_requests) - 3} more saved request(s)"
+        )
+
+    return "\n".join(lines)
+
+
+def notification_channel_for_event(event_result):
+    """Force Telegram when a matching pending action asked for notification."""
+
+    matches = (event_result or {}).get(
+        "matching_actions",
+        []
+    )
+
+    if any(action.get("notify", True) for action in matches):
+        return "telegram"
+
+    return NOTIFICATION_CHANNEL
 
 
 # ============================================================
@@ -498,9 +646,14 @@ def collect_assignments():
 
     for assignment in result:
 
+        course_identity = get_course_identity(
+            assignment.get("course")
+        )
+
         assignments.append({
             "id": assignment_key(assignment),
-            "course": assignment.get("course"),
+            "course_id": course_identity.get("course_id"),
+            "course": course_identity.get("course_name"),
             "name": assignment.get("name"),
             "url": assignment.get("url"),
             "due": assignment.get("due"),
@@ -548,9 +701,14 @@ def collect_quizzes():
 
     for quiz in result:
 
+        course_identity = get_course_identity(
+            quiz.get("course")
+        )
+
         quizzes.append({
             "id": quiz_key(quiz),
-            "course": quiz.get("course"),
+            "course_id": course_identity.get("course_id"),
+            "course": course_identity.get("course_name"),
             "name": quiz.get("name"),
             "url": quiz.get("url"),
             "opened": quiz.get("opened"),
@@ -625,6 +783,7 @@ def collect_attendance(courses):
             continue
 
         attendance_state[course_name] = {
+            "course_id": course.get("id"),
             "status": result.get("status"),
             "percentage": result.get(
                 "percentage"
@@ -931,6 +1090,7 @@ def find_attendance_changes(
 
             changes.append({
                 "course": course_name,
+                "course_id": new_data.get("course_id"),
                 "type": "new_course_attendance",
                 "old": None,
                 "new": new_data
@@ -950,6 +1110,7 @@ def find_attendance_changes(
 
             changes.append({
                 "course": course_name,
+                "course_id": new_data.get("course_id"),
                 "type": "status_changed",
                 "old": old_status,
                 "new": new_status
@@ -967,6 +1128,7 @@ def find_attendance_changes(
 
             changes.append({
                 "course": course_name,
+                "course_id": new_data.get("course_id"),
                 "type": "percentage_changed",
                 "old": old_percentage,
                 "new": new_percentage
@@ -986,6 +1148,7 @@ def find_attendance_changes(
 
             changes.append({
                 "course": course_name,
+                "course_id": new_data.get("course_id"),
                 "type": "sessions_changed",
                 "old": old_sessions,
                 "new": new_sessions
@@ -1121,7 +1284,8 @@ def log_action(action_type, message):
 
 def execute_action(
     action_type,
-    message
+    message,
+    channel=None
 ):
     """
     Execute one action.
@@ -1190,7 +1354,7 @@ def execute_action(
     notification_sent = send_notification(
         action_type,
         message,
-        channel=NOTIFICATION_CHANNEL
+        channel=(channel or NOTIFICATION_CHANNEL)
     )
 
     if notification_sent:
@@ -1230,18 +1394,42 @@ def execute_action(
 def handle_new_assignment(assignment):
     """
     Handle a newly detected assignment.
+
+    The event is persisted before notification so the conversational agent can
+    later answer questions such as "شو فاتني؟" even if Telegram was missed.
     """
+
+    payload = {
+        "course_id": assignment.get("course_id"),
+        "course_name": assignment.get("course"),
+        "assignment_id": assignment.get("id"),
+        "name": assignment.get("name"),
+        "url": assignment.get("url"),
+        "due": assignment.get("due"),
+        "submission_status": assignment.get("submission_status"),
+        "grading_status": assignment.get("grading_status"),
+        "time_remaining": assignment.get("time_remaining")
+    }
+
+    event_result = record_agent_event(
+        "assignment_added",
+        payload
+    )
 
     message = (
         f"New assignment '{assignment.get('name')}' "
         f"in {assignment.get('course')}. "
         f"Due: {assignment.get('due')}. "
         f"URL: {assignment.get('url')}"
+        f"{pending_action_note(event_result)}"
     )
 
     return execute_action(
         "NEW_ASSIGNMENT",
-        message
+        message,
+        channel=notification_channel_for_event(
+            event_result
+        )
     )
 
 
@@ -1250,15 +1438,33 @@ def handle_new_assignment(assignment):
 # ============================================================
 
 def handle_changed_assignment(change):
-    """
-    Handle a changed assignment.
-    """
+    """Handle an important change to an existing assignment."""
 
     action_count = 0
 
     assignment = change.get(
         "assignment",
         {}
+    )
+
+    payload = {
+        "course_id": assignment.get("course_id"),
+        "course_name": assignment.get("course"),
+        "assignment_id": assignment.get("id"),
+        "name": assignment.get("name"),
+        "url": assignment.get("url"),
+        "due": assignment.get("due"),
+        "changes": change.get("changes", [])
+    }
+
+    event_result = record_agent_event(
+        "assignment_changed",
+        payload
+    )
+
+    note = pending_action_note(event_result)
+    channel = notification_channel_for_event(
+        event_result
     )
 
     for field_change in change.get(
@@ -1272,11 +1478,13 @@ def handle_changed_assignment(change):
             f"changed field '{field_change.get('field')}' "
             f"from '{field_change.get('old')}' "
             f"to '{field_change.get('new')}'."
+            f"{note}"
         )
 
         if execute_action(
             "ASSIGNMENT_CHANGED",
-            message
+            message,
+            channel=channel
         ):
 
             action_count += 1
@@ -1289,9 +1497,25 @@ def handle_changed_assignment(change):
 # ============================================================
 
 def handle_new_quiz(quiz):
-    """
-    Handle a newly detected quiz.
-    """
+    """Handle a newly detected quiz and persist it as an agent event."""
+
+    payload = {
+        "course_id": quiz.get("course_id"),
+        "course_name": quiz.get("course"),
+        "quiz_id": quiz.get("id"),
+        "name": quiz.get("name"),
+        "url": quiz.get("url"),
+        "opened": quiz.get("opened"),
+        "closed": quiz.get("closed"),
+        "attempts_allowed": quiz.get("attempts_allowed"),
+        "time_limit": quiz.get("time_limit"),
+        "attempt_status": quiz.get("attempt_status")
+    }
+
+    event_result = record_agent_event(
+        "quiz_added",
+        payload
+    )
 
     message = (
         f"New quiz '{quiz.get('name')}' "
@@ -1299,11 +1523,15 @@ def handle_new_quiz(quiz):
         f"Opened: {quiz.get('opened')}. "
         f"Closed: {quiz.get('closed')}. "
         f"URL: {quiz.get('url')}"
+        f"{pending_action_note(event_result)}"
     )
 
     return execute_action(
         "NEW_QUIZ",
-        message
+        message,
+        channel=notification_channel_for_event(
+            event_result
+        )
     )
 
 
@@ -1312,15 +1540,32 @@ def handle_new_quiz(quiz):
 # ============================================================
 
 def handle_changed_quiz(change):
-    """
-    Handle a changed quiz.
-    """
+    """Handle an important change to an existing quiz."""
 
     action_count = 0
 
     quiz = change.get(
         "quiz",
         {}
+    )
+
+    payload = {
+        "course_id": quiz.get("course_id"),
+        "course_name": quiz.get("course"),
+        "quiz_id": quiz.get("id"),
+        "name": quiz.get("name"),
+        "url": quiz.get("url"),
+        "changes": change.get("changes", [])
+    }
+
+    event_result = record_agent_event(
+        "quiz_changed",
+        payload
+    )
+
+    note = pending_action_note(event_result)
+    channel = notification_channel_for_event(
+        event_result
     )
 
     for field_change in change.get(
@@ -1334,11 +1579,13 @@ def handle_changed_quiz(change):
             f"changed field '{field_change.get('field')}' "
             f"from '{field_change.get('old')}' "
             f"to '{field_change.get('new')}'."
+            f"{note}"
         )
 
         if execute_action(
             "QUIZ_CHANGED",
-            message
+            message,
+            channel=channel
         ):
 
             action_count += 1
@@ -1352,16 +1599,11 @@ def handle_changed_quiz(change):
 
 def handle_attendance_changes(changes):
     """
-    Handle multiple attendance changes for the same course
-    as one action and one notification.
+    Handle grouped attendance changes for one course.
 
-    Event Detection may detect several changes for the same
-    course during one monitoring cycle.
-
-    Instead of sending one notification for every change,
-    this function groups them into one readable message.
-
-    This does NOT submit attendance.
+    A Closed -> Open transition is emitted as ``attendance_opened``. Other
+    changes are emitted as ``attendance_changed``. This remains read-only and
+    never submits attendance.
     """
 
     if not changes:
@@ -1369,6 +1611,39 @@ def handle_attendance_changes(changes):
 
     course = changes[0].get(
         "course"
+    )
+    course_id = changes[0].get(
+        "course_id"
+    )
+
+    attendance_opened = any(
+        change.get("type") == "status_changed"
+        and str(change.get("new") or "").strip().lower() == "open"
+        and str(change.get("old") or "").strip().lower() != "open"
+        for change in changes
+    )
+
+    current_status = None
+    for change in changes:
+        if change.get("type") == "status_changed":
+            current_status = change.get("new")
+
+    payload = {
+        "course_id": course_id,
+        "course_name": course,
+        "status": current_status,
+        "changes": changes
+    }
+
+    event_type = (
+        "attendance_opened"
+        if attendance_opened
+        else "attendance_changed"
+    )
+
+    event_result = record_agent_event(
+        event_type,
+        payload
     )
 
     message_lines = [
@@ -1421,13 +1696,29 @@ def handle_attendance_changes(changes):
                 f"{old_value} -> {new_value}"
             )
 
+    note = pending_action_note(
+        event_result
+    )
+
+    if note:
+        message_lines.append(note)
+
     message = "\n".join(
         message_lines
     )
 
+    notification_type = (
+        "ATTENDANCE_OPENED"
+        if attendance_opened
+        else "ATTENDANCE_CHANGED"
+    )
+
     return execute_action(
-        "ATTENDANCE_CHANGED",
-        message
+        notification_type,
+        message,
+        channel=notification_channel_for_event(
+            event_result
+        )
     )
 
 

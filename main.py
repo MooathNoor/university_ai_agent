@@ -22,12 +22,15 @@ from tools import (
     get_course_name,
     get_course_id,
 )
+from course_registry import CourseRegistry
+from agent_core import AgentCore, AgentDecision
+from event_state import EventState
 
 
 # CONFIG
 MODEL_NAME = "llama3.2:3b"
 COURSE_SEMANTIC_INDEX_FILE = "course_semantic_index.json"
-COURSE_SEMANTIC_INDEX_VERSION = 8
+COURSE_SEMANTIC_INDEX_VERSION = 9
 LEARNED_RULES_FILE = "agent_learned_rules.json"
 LEARNED_RULES_VERSION = 1
 _UNSET = object()
@@ -40,6 +43,19 @@ _course_index_cache = {
     "profiles": None,
 }
 _pending_course_resolution = None
+
+
+_course_registry = CourseRegistry(
+    load_courses=get_cached_courses,
+    get_course_name=get_course_name,
+    get_course_id=get_course_id,
+    loaders={
+        "assignments": get_assignments,
+        "quizzes": get_quizzes,
+        "resources": get_course_resources,
+        "attendance": get_attendance,
+    },
+)
 
 
 # CONTEXT
@@ -88,6 +104,9 @@ Important rules:
    use that context before asking for clarification.
 """
 
+
+_agent_core = AgentCore(ollama.chat, MODEL_NAME)
+_event_state = EventState()
 
 # BASIC TEXT HELPERS
 
@@ -525,6 +544,8 @@ def _sync_conversation_state(
             kind = "assignment"
         elif effective_type == "quiz" or "/quiz/" in str(selected_item.get("url", "")):
             kind = "quiz"
+        elif effective_type == "course_resource":
+            kind = "course_resource"
         if kind:
             _conversation_state["active_entity"] = {
                 "type": kind,
@@ -1496,8 +1517,9 @@ Rules:
         print("[DEBUG] Rejected ambiguous semantic course score; clarification required.")
         return []
 
-    # Only very high-confidence semantic matches are allowed to become trusted aliases.
-    if reference and len(reference.split()) <= 4:
+    # Only very high-confidence, course-like phrases may become trusted aliases.
+    # Generic actions/predicates are never persisted as course names.
+    if reference and _safe_auto_course_alias(reference):
         _learn_course_alias(top_course, reference, courses)
     return [top_course]
 
@@ -1577,8 +1599,15 @@ def resolve_courses(user_input, allow_ai=True):
         _clear_pending_course_resolution()
         return matches if allow_multiple else matches[:1]
 
-    # 3) Grounded semantic classifier only for an actual course-like reference.
-    if allow_ai:
+    # 3) If the conversation already has a grounded course and the current turn
+    # does NOT explicitly introduce another course, reuse context. Never send
+    # action/predicate fragments (e.g. "ترسل ثالث", "بده") to the course scorer.
+    if context_course and not _explicit_course_marker(user_input):
+        print(f"[DEBUG] Reusing course context before AI scorer: {get_course_name(context_course)}")
+        return [context_course]
+
+    # 4) Grounded semantic classifier only for an actual course-like reference.
+    if allow_ai and _safe_auto_course_alias(reference):
         matches = ai_course_match(
             reference,
             courses,
@@ -1587,6 +1616,10 @@ def resolve_courses(user_input, allow_ai=True):
         if matches:
             _clear_pending_course_resolution()
             return matches if allow_multiple else matches[:1]
+        _set_pending_course_resolution(user_input, courses)
+    elif allow_ai and _explicit_course_marker(user_input):
+        # Explicitly naming "مادة ..." but giving unusable text should clarify,
+        # never silently fall back to an old course.
         _set_pending_course_resolution(user_input, courses)
     return []
 
@@ -1736,6 +1769,9 @@ def _is_pending_work_request(text):
         "غير محلول", "غير محلوله", "لسا ما حليت", "لسه ما حليت",
         "مطلوب مني حاليا", "علي حاليا", "pending", "not completed",
         "not submitted", "unfinished",
+        "لم يتم تسليمه", "لم يتم تسليمها", "لم يتم التسليم",
+        "ما تم تسليمه", "ما تم تسليمها", "غير مسلم", "غير مسلمة",
+        "ما سلمته", "ما سلمتها", "لسا ما سلمت", "لسه ما سلمت",
     ]
     existence_markers = ["هل يوجد", "في حاليا", "فيه حاليا", "هل في", "هل فيه", "اي واجب", "اي كويز"]
     return bool(has_work and (contains_any(text, pending_markers) or contains_any(text, existence_markers)))
@@ -1810,6 +1846,36 @@ def _looks_like_assignment_solution_request(user_input):
     return False
 
 
+def extract_ordinal_index(text):
+    """Return a 1-based ordinal position explicitly requested by the user."""
+    normalized = normalize_text(text)
+    ordinal_groups = {
+        1: ["اول", "الاول", "الأول", "first"],
+        2: ["ثاني", "الثاني", "الثانية", "الثانيه", "second"],
+        3: ["ثالث", "الثالث", "الثالثة", "الثالثه", "third"],
+        4: ["رابع", "الرابع", "الرابعة", "الرابعه", "fourth"],
+        5: ["خامس", "الخامس", "الخامسة", "الخامسه", "fifth"],
+        6: ["سادس", "السادس", "السادسة", "السادسه", "sixth"],
+        7: ["سابع", "السابع", "السابعة", "السابعه", "seventh"],
+        8: ["ثامن", "الثامن", "الثامنة", "الثامنه", "eighth"],
+        9: ["تاسع", "التاسع", "التاسعة", "التاسعه", "ninth"],
+        10: ["عاشر", "العاشر", "العاشرة", "العاشره", "tenth"],
+    }
+    for index, variants in ordinal_groups.items():
+        if contains_any(normalized, variants):
+            return index
+    match = re.search(
+        r"(?:واجب|assignment|كويز|quiz|اختبار|test)\s*(?:رقم\s*)?(\d+)",
+        normalized,
+    )
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    return None
+
+
 def _fast_semantic_analysis(user_input):
     """
     Fast local language pass used before the LLM.
@@ -1879,11 +1945,15 @@ def _fast_semantic_analysis(user_input):
         intents.append("deadlines")
     selection = "none"
     count = None
+    ordinal_index = extract_ordinal_index(text)
     if re.search(r"(?:^|\s)(?:كل|جميع|كامل|كافة)(?:\s|$)", text):
         selection = "all"
-    elif contains_any(text, ["اول", "الأول", "الاول", "first", "earliest"]):
+    elif ordinal_index == 1:
         selection = "first"
         count = 1
+    elif ordinal_index and ordinal_index > 1:
+        selection = "ordinal"
+        count = ordinal_index
     elif contains_any(text, ["اخر", "الأخير", "الاخير", "last", "latest"]):
         selection = "last"
         count = 1
@@ -1893,13 +1963,10 @@ def _fast_semantic_analysis(user_input):
     elif contains_any(text, ["السابق", "الماضي", "previous"]):
         selection = "previous"
         count = 1
-    elif (
-        contains_any(text, ["اللي صار", "اللي صارت", "completed", "held"])
-        or re.search(r"(?:^|\s)خلص(?:\s|$)", text)
-    ):
+    elif contains_any(text, ["اللي صار", "اللي صارت", "completed", "held"]):
         selection = "completed"
     explicit_number = extract_number(text)
-    if explicit_number and selection != "all":
+    if explicit_number and selection not in {"all", "ordinal"}:
         count = explicit_number
     # Conservative multi-course signal. The actual course identities are resolved
     # later against Moodle rather than guessed here.
@@ -2052,7 +2119,7 @@ def detect_intents(user_input):
     fallback_groups = [
         ("quiz_grades", ["علاماتي", "درجاتي", "quiz grades"]),
         ("selected_grade", ["علامتي", "درجتي", "score", "grade", "mark"]),
-        ("assignment_files", ["ارسل الملف", "ابعث الملف", "المرفق", "attachment"]),
+        ("assignment_files", ["ارسل الملف", "ارسلي الملف", "ابعث الملف", "هات الملف", "ملف الواجب", "الملف الي معتمد", "الملف اللي معتمد", "المرفق", "attachment"]),
         ("assignment_submission", ["طريقة التسليم", "طريقه التسليم", "كيف اسلم", "نوع التسليم"]),
         ("selected_item_timing", ["متى ببدا", "متى ببدأ", "متى بخلص", "متى ينتهي", "متى يفتح"]),
         ("assignment_details", ["شو مطلوب", "ما المطلوب", "تفاصيل الواجب"]),
@@ -2215,7 +2282,6 @@ def is_completed_request(text):
             "اللي صارت",
             "صار",
             "صارت",
-            "خلص",
             "completed",
             "held",
         ]
@@ -2257,9 +2323,7 @@ def apply_temporal_filter(
     dated_items.sort(
         key=lambda item: item["_parsed_date"]
     )
-    # --------------------------------------------------------
     # Completed
-    # --------------------------------------------------------
     if is_completed_request(text):
         now = datetime.now()
         completed = [
@@ -2269,9 +2333,7 @@ def apply_temporal_filter(
         ]
         if completed:
             dated_items = completed
-    # --------------------------------------------------------
     # Next / upcoming
-    # --------------------------------------------------------
     if is_next_request(text):
         now = datetime.now()
         upcoming = [
@@ -2281,9 +2343,7 @@ def apply_temporal_filter(
         ]
         if upcoming:
             dated_items = upcoming
-    # --------------------------------------------------------
     # Earliest
-    # --------------------------------------------------------
     if is_earliest_request(text):
         return [
             {
@@ -2293,9 +2353,7 @@ def apply_temporal_filter(
             }
             for item in dated_items[:1]
         ]
-    # --------------------------------------------------------
     # Latest
-    # --------------------------------------------------------
     if is_latest_request(text):
         return [
             {
@@ -2305,12 +2363,23 @@ def apply_temporal_filter(
             }
             for item in dated_items[-1:]
         ]
-    # --------------------------------------------------------
+    # Exact ordinal item (second, third, ... / رقم 2, رقم 3, ...)
+    ordinal_index = extract_ordinal_index(text)
+    if ordinal_index and ordinal_index > 1:
+        position = ordinal_index - 1
+        if position < len(dated_items):
+            item = dated_items[position]
+            return [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key != "_parsed_date"
+                }
+            ]
+        return []
+
     # Requested count
-    # --------------------------------------------------------
-    count = extract_requested_count(
-        text
-    )
+    count = extract_requested_count(text)
     if count and count > 1:
         selected = dated_items[:count]
         return [
@@ -3030,6 +3099,10 @@ def is_contextual_message(user_input):
         "ارسل الملف",
         "ارسلي الملف",
         "ابعث الملف",
+        "هات الملف",
+        "الملف الي معتمد",
+        "الملف اللي معتمد",
+        "ملف الواجب",
         "المرفق",
         "علاماتي",
         "درجاتي",
@@ -3048,6 +3121,17 @@ def is_contextual_message(user_input):
     return False
 
 
+def _is_assignment_file_followup(user_input):
+    if not (_active_entity_item("assignment") or has_selected_item("assignment")):
+        return False
+    text = normalize_text(user_input)
+    return contains_any(text, [
+        "ارسل الملف", "ارسلي الملف", "ابعث الملف", "ابعت الملف", "هات الملف",
+        "ملف الواجب", "مرفق الواجب", "مرفقات الواجب", "الملف الي معتمد",
+        "الملف اللي معتمد", "الملف المعتمد", "attachment", "attached file",
+    ])
+
+
 def handle_contextual_follow_up(
     user_input
 ):
@@ -3055,6 +3139,10 @@ def handle_contextual_follow_up(
         user_input
     ):
         return None
+    # A file request about an already selected assignment is object-context, not
+    # a new course reference. Resolve it before semantic/course routing.
+    if _is_assignment_file_followup(user_input):
+        return handle_assignment_files(user_input)
     # A plural grade follow-up such as "كم علاماتي فيهم" should reuse the
     # previously displayed quiz list without sending the wording to Ollama.
     grade_words = contains_any(user_input, [
@@ -3114,33 +3202,23 @@ def handle_contextual_follow_up(
     primary = detect_primary_intent(
         user_input
     )
-    # --------------------------------------------------------
     # Selected quiz grade
-    # --------------------------------------------------------
     if primary == "selected_grade":
         return handle_selected_grade(user_input)
-    # --------------------------------------------------------
     # Assignment details
-    # --------------------------------------------------------
     if primary == "assignment_details":
         return handle_assignment_details(user_input)
-    # --------------------------------------------------------
     # Selected item timing / assignment metadata
-    # --------------------------------------------------------
     if primary == "selected_item_timing":
         return handle_selected_item_timing(user_input)
     if primary == "assignment_submission":
         return handle_assignment_submission(user_input)
     if primary == "assignment_files":
         return handle_assignment_files(user_input)
-    # --------------------------------------------------------
     # Solve assignment
-    # --------------------------------------------------------
     if primary == "solve_assignment":
         return handle_solve_assignment(user_input)
-    # --------------------------------------------------------
     # "والحضور؟"
-    # --------------------------------------------------------
     context_course = get_context_course()
     if (
         context_course
@@ -3176,9 +3254,7 @@ def handle_contextual_follow_up(
         return format_simple_result(
             result
         )
-    # --------------------------------------------------------
     # "والجدول؟"
-    # --------------------------------------------------------
     if (
         context_course
         and contains_any(
@@ -3364,51 +3440,43 @@ def format_simple_result(result):
 
 def execute_course_tool(
     intent,
-    course
+    course,
+    force_refresh=False,
 ):
-    course_name = get_course_name(
-        course
-    )
-    course_id = get_course_id(
-        course
-    )
-    if intent == "attendance":
-        result = get_attendance(
-            course_name
-        )
-        return result
+    """Execute one grounded course action through the dynamic course workspace."""
+    course_name = get_course_name(course)
+    course_id = get_course_id(course)
+
+    registry_sections = {
+        "attendance": "attendance",
+        "course_files": "resources",
+        "assignments": "assignments",
+        "quizzes": "quizzes",
+    }
+    section = registry_sections.get(intent)
+    if section:
+        return _course_registry.get(section, course, force=force_refresh)
     if intent == "schedule":
-        result = get_course_schedule(
-            course_name
-        )
-        return result
+        return get_course_schedule(course_name)
     if intent == "course_info":
-        result = get_course_info(
-            course_name
-        )
-        return result
-    if intent == "course_files":
-        return get_course_resources(course_name)
-    if intent == "assignments":
-        result = get_assignments(
-            course_name
-        )
-        return result
-    if intent == "quizzes":
-        result = get_quizzes(
-            course_name
-        )
-        return result
+        return get_course_info(course_name)
     return {
         "status": "Error",
-        "message": (
-            f"Unsupported course intent: {intent}"
-        ),
+        "message": f"Unsupported course intent: {intent}",
         "course_id": course_id,
     }
 
 
 # MULTI-COURSE AGGREGATION
+
+
+def _force_refresh_requested(user_input):
+    text = normalize_text(user_input)
+    return contains_any(text, [
+        "تاكد", "تأكد", "ارجع تاكد", "ارجع تأكد", "افحص", "تفقد",
+        "حدث", "حدّث", "جديد", "جديده", "جديدة", "new",
+        "refresh", "check again", "recheck",
+    ])
 
 
 def execute_for_courses(
@@ -3429,22 +3497,14 @@ def execute_for_courses(
     for course in courses:
         result = execute_course_tool(
             intent,
-            course
+            course,
+            force_refresh=_force_refresh_requested(user_input),
         )
         if isinstance(result, list):
-            filtered = result
-            if intent == "assignments":
-                filtered = filter_assignments(
-                    result,
-                    user_input
-                )
-            elif intent == "quizzes":
-                filtered = filter_quizzes(
-                    result,
-                    user_input
-                )
-            # Save course information into items
-            for item in filtered:
+            # Keep the complete per-course result here. Selection/filtering belongs
+            # to the intent handler and must happen exactly once; double-filtering
+            # breaks ordinal requests such as "ثاني واجب".
+            for item in result:
                 if isinstance(item, dict):
                     item = dict(item)
                     item.setdefault(
@@ -3520,6 +3580,35 @@ def select_single_item_per_course(
 # RUN SINGLE INTENT
 
 
+def _format_course_info_for_question(result, user_input):
+    """Project course-info data to the field the user actually asked for.
+
+    This keeps tools factual and avoids dumping an entire Moodle course page for
+    a narrow question. Unknown fields are reported as unavailable instead of
+    guessed.
+    """
+    result = _unwrap_course_tool_result(result)
+    if not isinstance(result, dict):
+        return format_simple_result(result)
+    text = normalize_text(user_input)
+
+    if contains_any(text, ["الدكتور", "دكتور", "المدرس", "مدرس", "instructor", "teacher"]):
+        instructor = result.get("instructor") or result.get("teacher") or result.get("teachers")
+        if instructor:
+            if isinstance(instructor, list):
+                return "، ".join(str(x) for x in instructor if x)
+            return str(instructor)
+        return "اسم الدكتور مش موجود ضمن البيانات اللي أداة Moodle الحالية استخرجتها، فما رح أخمّن اسمه."
+
+    if contains_any(text, ["كم ساعه", "كم ساعة", "ساعات الماده", "ساعات المادة", "credit"]):
+        credits = result.get("credit_hours") or result.get("credits")
+        if credits not in (None, ""):
+            return f"عدد ساعات المادة: {credits}."
+        return "عدد الساعات مش موجود ضمن البيانات اللي أداة Moodle الحالية استخرجتها."
+
+    return format_simple_result(result)
+
+
 def run_single_intent(
     intent,
     user_input
@@ -3551,17 +3640,13 @@ def run_single_intent(
         return format_simple_result(result)
 
     courses = []
-    # --------------------------------------------------------
     # Scope: explicit all-current-courses requests must bypass course scoring.
-    # --------------------------------------------------------
     all_courses_scope = _is_all_courses_scope(user_input)
     explicit_courses = load_courses() if all_courses_scope else resolve_courses(
         user_input,
         allow_ai=True
     )
-    # --------------------------------------------------------
     # Context course
-    # --------------------------------------------------------
     if explicit_courses:
         courses = explicit_courses
     else:
@@ -3586,9 +3671,7 @@ def run_single_intent(
         and intent in {"attendance", "schedule", "course_info", "course_files", "assignments", "quizzes", "quiz_grades"}
     ):
         return _course_clarification_message()
-    # --------------------------------------------------------
     # Courses
-    # --------------------------------------------------------
     if intent == "courses":
         result = get_my_courses()
         if isinstance(result, dict):
@@ -3610,10 +3693,7 @@ def run_single_intent(
         return format_simple_result(
             result
         )
-    # --------------------------------------------------------
-    # --------------------------------------------------------
     # Deadlines
-    # --------------------------------------------------------
     if intent == "deadlines":
         result = get_upcoming_deadlines()
         # If user explicitly specified courses,
@@ -3662,9 +3742,7 @@ def run_single_intent(
                 f"{item.get('due_date', '')}"
             )
         return "\n".join(lines)
-    # --------------------------------------------------------
     # Course files / resources
-    # --------------------------------------------------------
     if intent == "course_files":
         if not courses:
             return "حددلي اسم المادة حتى أجيب ملفاتها من Moodle."
@@ -3672,7 +3750,7 @@ def run_single_intent(
         all_resources = []
         for course in courses:
             course_name = get_course_name(course)
-            resources = get_course_resources(course_name)
+            resources = execute_course_tool("course_files", course)
             if isinstance(resources, dict):
                 blocks.append(format_simple_result(resources))
                 continue
@@ -3699,9 +3777,7 @@ def run_single_intent(
         )
         return "\n".join(blocks)
 
-    # --------------------------------------------------------
     # Quiz grades
-    # --------------------------------------------------------
     if intent == "quiz_grades":
         if not courses:
             previous = context_items_for_type("quiz")
@@ -3712,19 +3788,17 @@ def run_single_intent(
             blocks = []
             for course in courses:
                 course_name = get_course_name(course)
-                quizzes = get_quizzes(course_name)
+                quizzes = execute_course_tool("quizzes", course)
                 grades = get_quiz_grades(course_name=course_name, quizzes=quizzes if isinstance(quizzes, list) else None)
                 blocks.append(f"علامات كويزات {course_name}:\n{format_quiz_grades(grades)}")
             return "\n\n".join(blocks)
         course_name = get_course_name(courses[0])
-        quizzes = get_quizzes(course_name)
+        quizzes = execute_course_tool("quizzes", courses[0])
         if isinstance(quizzes, dict):
             return format_simple_result(quizzes)
         return handle_quiz_grades(user_input, quizzes=quizzes)
 
-    # --------------------------------------------------------
     # Attendance / Schedule / Course Info
-    # --------------------------------------------------------
     if intent in [
         "attendance",
         "schedule",
@@ -3765,6 +3839,8 @@ def run_single_intent(
             )
             if intent == "attendance":
                 return format_attendance_result(unwrapped, user_input)
+            if intent == "course_info":
+                return _format_course_info_for_question(unwrapped, user_input)
             return format_simple_result(
                 unwrapped
             )
@@ -3792,9 +3868,7 @@ def run_single_intent(
             user_input=user_input,
         )
         return "\n".join(lines)
-    # --------------------------------------------------------
     # Assignments
-    # --------------------------------------------------------
     if intent == "assignments":
         if courses:
             results = execute_for_courses(
@@ -3902,9 +3976,7 @@ def run_single_intent(
             filtered,
             count_only=False
         )
-    # --------------------------------------------------------
     # Quizzes
-    # --------------------------------------------------------
     if intent == "quizzes":
         if courses:
             results = execute_for_courses(
@@ -4022,35 +4094,25 @@ def run_single_intent(
             filtered,
             user_input
         )
-    # --------------------------------------------------------
     # Grades
-    # --------------------------------------------------------
     if intent == "quiz_grades":
         return handle_quiz_grades(user_input)
     if intent == "selected_grade":
         return handle_selected_grade(user_input)
-    # --------------------------------------------------------
     # Selected item timing / assignment metadata
-    # --------------------------------------------------------
     if intent == "selected_item_timing":
         return handle_selected_item_timing(user_input)
     if intent == "assignment_submission":
         return handle_assignment_submission(user_input)
     if intent == "assignment_files":
         return handle_assignment_files(user_input)
-    # --------------------------------------------------------
     # Assignment details
-    # --------------------------------------------------------
     if intent == "assignment_details":
         return handle_assignment_details(user_input)
-    # --------------------------------------------------------
     # Solve assignment
-    # --------------------------------------------------------
     if intent == "solve_assignment":
         return handle_solve_assignment(user_input)
-    # --------------------------------------------------------
     # Announcements
-    # --------------------------------------------------------
     if intent == "announcements":
         result = get_announcements()
         save_context(
@@ -4110,9 +4172,124 @@ def run_multiple_intents(
 # SAFE AI FALLBACK
 
 
-def general_ai_response(
-    user_input
-):
+def _grounded_state_payload():
+    """Return a compact, JSON-safe snapshot for conversational reasoning.
+
+    The LLM may reason over this payload, but it is explicitly forbidden from
+    inventing Moodle facts that are not present here.
+    """
+    active_course = _conversation_state.get("active_course")
+    active_entity = _conversation_state.get("active_entity")
+    last_result_set = _conversation_state.get("last_result_set") or {}
+
+    payload = {
+        "active_course": active_course if isinstance(active_course, dict) else None,
+        "active_entity": active_entity if isinstance(active_entity, dict) else None,
+        "last_intent": _conversation_state.get("last_intent"),
+        "last_result_set": None,
+        "pending_work": None,
+        "event_state": _event_state.snapshot(max_events=10, max_actions=10),
+        "last_context_timestamp": _last_context.get("timestamp"),
+    }
+
+    if isinstance(last_result_set, dict) and last_result_set.get("type"):
+        items = [x for x in last_result_set.get("items", []) if isinstance(x, dict)]
+        payload["last_result_set"] = {
+            "type": last_result_set.get("type"),
+            "course_id": last_result_set.get("course_id"),
+            "course_name": last_result_set.get("course_name"),
+            "items": items[:10],
+            "item_count": len(items),
+        }
+
+    if _conversation_state.get("last_intent") == "pending_work":
+        raw = _last_context.get("raw_result")
+        if isinstance(raw, dict):
+            payload["pending_work"] = raw
+    return payload
+
+
+def _has_grounded_state():
+    payload = _grounded_state_payload()
+    return bool(
+        payload.get("active_course")
+        or payload.get("active_entity")
+        or payload.get("last_result_set")
+        or payload.get("pending_work")
+        or (payload.get("event_state") or {}).get("recent_events")
+        or (payload.get("event_state") or {}).get("pending_actions")
+    )
+
+
+def _state_aware_general_response(user_input):
+    """Use the local LLM as a conversational reasoner over grounded state.
+
+    This is intentionally different from the deterministic tool router. It is
+    used for open-ended language, advice, references and normal conversation.
+    The model can interpret the user's meaning, but Moodle facts are limited to
+    the state payload supplied below.
+    """
+    state = _grounded_state_payload()
+    prompt = f"""
+You are the conversational reasoning layer of a university AI agent.
+Reply naturally in the user's language/dialect.
+
+GROUNDING RULES:
+- The JSON STATE below is trusted data already obtained from tools/Moodle.
+- Never invent a Moodle fact, file content, teacher name, submission state,
+  deadline, grade, quiz detail, or assignment requirement that is not in STATE.
+- You may give normal advice or opinions, but clearly distinguish advice from
+  factual Moodle data.
+- Resolve pronouns/references like \"هاض\", \"هو\", \"اللي قبل\" from STATE when possible.
+- If the user asks what a file says but STATE only has its name/URL and not its
+  contents, say that the content has not been read yet; do not guess.
+- Keep the answer concise unless the user asks for detail.
+
+STATE:
+{json.dumps(state, ensure_ascii=False, default=str)}
+
+USER MESSAGE:
+{user_input}
+"""
+    try:
+        start = time.time()
+        response = ollama.chat(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        print(f"[DEBUG] State-aware conversation time: {time.time() - start:.2f} seconds")
+        return response["message"]["content"]
+    except Exception as error:
+        print(f"[DEBUG] State-aware conversation error: {error}")
+        return "فهمت عليك، بس ما قدرت أشغّل طبقة الفهم اللغوي هالمرة."
+
+
+def _should_use_state_reasoner(user_input):
+    """Decide generically whether an open-ended turn belongs to grounded state.
+
+    High-confidence tool intents and explicit course requests stay in the fast
+    deterministic router. Everything else may be interpreted by the LLM using
+    the current grounded conversation state.
+    """
+    if not _has_grounded_state():
+        return False
+    if _message_may_define_future_action(user_input):
+        return True
+    fast = _fast_semantic_analysis(user_input)
+    if fast.get("intents"):
+        return False
+    if _explicit_course_marker(user_input):
+        return False
+    courses = load_courses()
+    if courses and deterministic_course_matches(user_input, courses):
+        return False
+    return True
+
+
+def general_ai_response(user_input):
     """
 
     Only for normal conversational messages.
@@ -4161,21 +4338,17 @@ def general_ai_response(
 def is_course_only_message(
     user_input
 ):
-    text = normalize_text(
-        user_input
-    )
+    """Detect a short pure course-selection turn without invoking the LLM."""
+    text = normalize_text(user_input)
     if len(text.split()) > 5:
         return False
-    intents = detect_intents(
-        user_input
-    )
-    if intents:
+    if _fast_semantic_analysis(user_input).get("intents"):
         return False
     courses = load_courses()
-    matches = deterministic_course_matches(
-        user_input,
-        courses
-    )
+    reference = _extract_course_reference(user_input) or user_input
+    matches = _learned_course_matches(reference, courses)
+    if not matches:
+        matches = deterministic_course_matches(reference, courses)
     return len(matches) == 1
 
 
@@ -4241,7 +4414,8 @@ def _is_agent_identity_question(user_input):
     """Recognize simple 'who are you / what can you do' questions locally."""
     text = normalize_text(user_input)
     identity = contains_any(text, [
-        "عرفني بنفسك", "عرف عن نفسك", "مين انت", "من انت", "شو انت",
+        "عرفني بنفسك", "عرف عن نفسك", "عرفني بحالك", "عرفني عن حالك",
+        "احكيلي عن حالك", "احكيلي عن نفسك", "مين انت", "من انت", "شو انت",
         "what are you", "who are you",
     ])
     capability = contains_any(text, [
@@ -4297,6 +4471,27 @@ def _is_all_courses_scope(user_input):
     ])
 
 
+def _is_monitoring_capability_question(user_input):
+    text = normalize_text(user_input)
+    asks_updates = contains_any(text, [
+        "كل تحديث", "كل تحديث بصير", "اذا نزل", "ادا نزل",
+        "لما ينزل", "اذا تفعل", "ادا تفعل", "لما يتفعل",
+        "تخبرني", "تنبهني", "اشعار", "اشعارات", "notify me",
+    ])
+    mentions_monitorable = contains_any(text, [
+        "واجب", "كويز", "اختبار", "الحضور", "ملف", "ملفات", "تحديث",
+    ])
+    ability = contains_any(text, ["بتقدر", "تقدر", "ممكن", "can you"])
+    return bool(ability and asks_updates and mentions_monitorable)
+
+
+def _monitoring_capability_response():
+    return (
+        "اه. بقدر أتابع تغييرات موادك مثل نزول واجب أو كويز أو ملف جديد وتغيّر الحضور. "
+        "التنبيه التلقائي يعتمد على تشغيل الـmonitor/البوت؛ أما لما تسألني يدويًا بقدر أعمل تحديث مباشر من Moodle للمادة المطلوبة."
+    )
+
+
 def _is_whats_new_question(user_input):
     text = normalize_text(user_input)
     return contains_any(text, [
@@ -4305,18 +4500,52 @@ def _is_whats_new_question(user_input):
     ])
 
 
-def _handle_last_course_resource_followup(user_input):
-    text = normalize_text(user_input).strip(" .,!؟?")
-    if text not in {"اخر ملف بس", "آخر ملف بس", "اخر ملف", "آخر ملف"}:
+def _handle_course_resource_selection_followup(user_input):
+    """Select first/last/ordinal resource from the last grounded resource list.
+
+    Explicit course mentions always belong to normal course routing. A previous
+    result set must never hijack a request such as "اول ملف من مادة الحوسبة".
+    """
+    if _explicit_course_marker(user_input):
         return None
     state = _conversation_state.get("last_result_set") or {}
     if state.get("type") != "course_resources":
         return None
+
+    text = normalize_text(user_input).strip(" .,!؟?")
+    has_file_word = contains_any(text, ["ملف", "file", "resource"])
+    if not has_file_word:
+        return None
+
+    analysis = _fast_semantic_analysis(user_input)
+    selection = analysis.get("selection")
+    count = analysis.get("count")
+    if selection not in {"first", "last", "ordinal"}:
+        return None
+
     items = [x for x in (state.get("items") or []) if isinstance(x, dict)]
     if not items:
         return "ما لقيت ملفات بالسياق الحالي."
-    item = items[-1]
-    name = item.get("name", "آخر ملف")
+
+    if selection == "last":
+        index = len(items) - 1
+    elif selection == "ordinal" and isinstance(count, int):
+        index = count - 1
+    else:
+        index = 0
+
+    if index < 0 or index >= len(items):
+        return f"القائمة الحالية فيها {len(items)} ملف/مورد فقط."
+
+    item = items[index]
+    course_name = item.get("course_name") or item.get("course") or state.get("course_name")
+    course_id = item.get("course_id") or state.get("course_id")
+    save_context(
+        intent="course_files", tool_name="state_selection", entity_type="course_resource",
+        selected_item=item, selected_items=[item], course_name=course_name,
+        course_id=course_id, display_result=[item], user_input=user_input,
+    )
+    name = item.get("name", f"ملف {index + 1}")
     url = item.get("url", "")
     return f"{name}" + ("\n" + str(url) if url else "")
 
@@ -4384,8 +4613,257 @@ def _handle_course_resource_filter_followup(user_input):
 ".join(lines)
 
 
-def _conversation_control(user_input):
-    """Cheap deterministic layer that runs before semantic/course routing."""
+
+def _selection_from_last_result(user_input):
+    """Resolve first/last/ordinal follow-ups against the last grounded list.
+
+    This is intentionally state-first: phrases such as "بدي ثالث واجب" must
+    never be interpreted as a new course name when an assignment list is already
+    active.
+    """
+    state = _conversation_state.get("last_result_set") or {}
+    kind = state.get("type")
+    if kind not in {"assignment", "quiz", "course_resources"}:
+        return None
+
+    items = [dict(x) for x in (state.get("items") or []) if isinstance(x, dict)]
+    if not items:
+        return None
+
+    # A new explicit course mention outranks the old result-set state.
+    if _explicit_course_marker(user_input):
+        return None
+
+    quick = _fast_semantic_analysis(user_input)
+    selection = quick.get("selection")
+    count = quick.get("count")
+    if selection not in {"first", "last", "ordinal"}:
+        return None
+
+    # If the user explicitly names another currently-known course, normal course
+    # routing owns the turn. Deterministic matching only; never wake Ollama here.
+    courses = load_courses()
+    direct = deterministic_course_matches(user_input, courses) if courses else []
+    if direct:
+        active_id = state.get("course_id")
+        if active_id is None or any(str(get_course_id(c)) != str(active_id) for c in direct):
+            return None
+
+    if selection == "last":
+        index = len(items) - 1
+    elif selection == "ordinal" and isinstance(count, int):
+        index = count - 1
+    else:
+        index = 0
+
+    if index < 0 or index >= len(items):
+        label = "عنصر"
+        if kind == "assignment":
+            label = "واجب"
+        elif kind == "quiz":
+            label = "كويز"
+        elif kind == "course_resources":
+            label = "ملف/مورد"
+        return f"القائمة الحالية فيها {len(items)} {label} فقط."
+
+    item = items[index]
+    course_name = item.get("course_name") or item.get("course") or state.get("course_name")
+    course_id = item.get("course_id") or state.get("course_id")
+
+    if kind == "assignment":
+        save_context(
+            intent="assignments", tool_name="state_selection", entity_type="assignment",
+            selected_item=item, selected_items=[item], course_name=course_name,
+            course_id=course_id, display_result=[item], user_input=user_input,
+        )
+        return format_assignments([item])
+
+    if kind == "quiz":
+        save_context(
+            intent="quizzes", tool_name="state_selection", entity_type="quiz",
+            selected_item=item, selected_items=[item], course_name=course_name,
+            course_id=course_id, display_result=[item], user_input=user_input,
+        )
+        return format_quizzes([item], user_input)
+
+    # A selected resource is a real conversational entity too. Persist it so
+    # later natural-language questions can refer to "هاض الملف" safely.
+    save_context(
+        intent="course_files", tool_name="state_selection", entity_type="course_resource",
+        selected_item=item, selected_items=[item], course_name=course_name,
+        course_id=course_id, display_result=[item], user_input=user_input,
+    )
+    name = item.get("name", f"ملف {index + 1}")
+    url = item.get("url", "")
+    return f"{name}" + ("\n" + str(url) if url else "")
+
+
+def _grounded_assignment_followup(user_input):
+    """Handle natural follow-ups on the currently selected assignment locally."""
+    assignment = _active_entity_item("assignment")
+    if not assignment and has_selected_item("assignment"):
+        assignment = get_selected_item()
+    if not isinstance(assignment, dict):
+        return None
+
+    text = normalize_text(user_input).strip(" .,!؟?")
+
+    # File/attachment request.
+    if _is_assignment_file_followup(user_input):
+        return handle_assignment_files(user_input)
+
+    # Solve request.
+    if _looks_like_assignment_solution_request(user_input):
+        return handle_solve_assignment(user_input)
+
+    # Requirement/explanation predicates. These deliberately include short
+    # colloquial forms that previously leaked into the course scorer ("شو بده؟").
+    requirement_markers = [
+        "شو بده", "ايش بده", "ماذا يريد", "اشرحلي الواجب", "اشرح الواجب",
+        "اشرحلي المطلوب", "فهمني الواجب", "فهمني المطلوب", "شو المطلوب",
+        "ايش المطلوب", "ما المطلوب", "المطلوب مني", "شو لازم", "ايش لازم",
+        "تفاصيل الواجب", "تعليمات الواجب", "شروط الواجب", "بخط اليد",
+        "طلب انو", "طلب انه",
+    ]
+    if contains_any(text, requirement_markers):
+        save_context(
+            intent="assignment_details", tool_name="state_followup", entity_type="assignment",
+            selected_item=assignment, selected_items=[assignment],
+            course_name=assignment.get("course_name") or assignment.get("course"),
+            course_id=assignment.get("course_id"), display_result=[assignment],
+            user_input=user_input,
+        )
+        return format_item_details(assignment)
+    return None
+
+
+def _grounded_quiz_followup(user_input):
+    """Answer metadata questions about the currently selected quiz locally."""
+    quiz = _active_entity_item("quiz")
+    if not quiz and has_selected_item("quiz"):
+        quiz = get_selected_item()
+    if not isinstance(quiz, dict):
+        return None
+
+    text = normalize_text(user_input).strip(" .,!؟?")
+    duration_markers = [
+        "كم كانت مدته", "كم مدته", "شو مدته", "مدة الكويز", "مده الكويز",
+        "كم الوقت", "قديش مدته", "time limit", "duration",
+    ]
+    attempts_markers = [
+        "كم محاوله", "كم محاولة", "عدد المحاولات", "كم مره بقدر",
+        "attempts allowed", "attempts",
+    ]
+
+    if contains_any(text, duration_markers):
+        value = str(quiz.get("time_limit") or "").strip()
+        save_context(
+            intent="quiz_details", tool_name="state_followup", entity_type="quiz",
+            selected_item=quiz, selected_items=[quiz],
+            course_name=quiz.get("course_name") or quiz.get("course"),
+            course_id=quiz.get("course_id"), display_result=[quiz],
+            user_input=user_input,
+        )
+        if value:
+            return f"مدة {quiz.get('name', 'الكويز')}: {value}."
+        return "مدة الكويز مش ظاهرة ضمن البيانات الحالية من Moodle."
+
+    if contains_any(text, attempts_markers):
+        value = str(quiz.get("attempts_allowed") or "").strip()
+        save_context(
+            intent="quiz_details", tool_name="state_followup", entity_type="quiz",
+            selected_item=quiz, selected_items=[quiz],
+            course_name=quiz.get("course_name") or quiz.get("course"),
+            course_id=quiz.get("course_id"), display_result=[quiz],
+            user_input=user_input,
+        )
+        if value:
+            return f"المحاولات المسموحة لـ{quiz.get('name', 'الكويز')}: {value}."
+        return "عدد المحاولات مش ظاهر ضمن البيانات الحالية من Moodle."
+    return None
+
+
+def _pending_work_followup(user_input):
+    """Reuse pending-work state only for short factual status follow-ups.
+
+    Open-ended advice/choice questions intentionally fall through to the
+    state-aware LLM reasoner. This keeps factual status fast without hard-coding
+    lifestyle phrases such as watching a series, going out, sleeping, etc.
+    """
+    if _conversation_state.get("last_intent") != "pending_work":
+        return None
+    text = normalize_text(user_input).strip(" .,!؟?")
+    # Choice/advice turns belong to the conversational reasoner.
+    if " ولا " in f" {text} " or len(text.split()) > 8:
+        return None
+    markers = [
+        "في اشي لازم اعمله", "في شي لازم اعمله", "في اشي علي", "شو علي حاليا",
+        "شو ضايل علي", "شو باقي علي", "لازم اعمل اشي",
+        "مطلوب مني اشي", "مطلوب مني حاليا",
+    ]
+    if not contains_any(text, markers):
+        return None
+
+    result = _last_context.get("raw_result")
+    if not isinstance(result, dict):
+        return None
+    status = result.get("status")
+    if status == "Success":
+        if result.get("has_pending"):
+            count = len(result.get("pending", []))
+            return f"اه، عندك {count} واجب/كويز حالي غير مكتمل حسب آخر فحص من Moodle."
+        return "لا، حسب آخر فحص من Moodle ما عندك واجب أو كويز حالي غير مكتمل. روح احضر المسلسل 😄"
+    if status == "Unknown":
+        return "لسا ما عندي تأكيد كافي من Moodle عن كل حالات التسليم/المحاولات."
+    return None
+
+
+def _state_first_followup(user_input):
+    """Conversation-state router that runs before semantic/course inference."""
+    selected = _selection_from_last_result(user_input)
+    if selected is not None:
+        return selected
+    assignment_response = _grounded_assignment_followup(user_input)
+    if assignment_response is not None:
+        return assignment_response
+    quiz_response = _grounded_quiz_followup(user_input)
+    if quiz_response is not None:
+        return quiz_response
+    pending_response = _pending_work_followup(user_input)
+    if pending_response is not None:
+        return pending_response
+    return None
+
+
+def _explicit_course_marker(user_input):
+    text = normalize_text(user_input)
+    return bool(re.search(r"(?:^|\s)(?:ماده|الماده|مادة|المادة|مساق|المساق|كورس|الكورس|course)(?:\s|$)", text))
+
+
+def _safe_auto_course_alias(reference):
+    """Allow automatic alias learning only for course-like noun phrases."""
+    text = normalize_text(reference).strip()
+    if not text or len(text) > 60:
+        return False
+    tokens = text.split()
+    if not 1 <= len(tokens) <= 4:
+        return False
+    blocked = {
+        "ترسل", "ارسلي", "ارسل", "ابعث", "هات", "اعطيني", "بدي", "بده", "بدها",
+        "اشرح", "اشرحلي", "فهمني", "شو", "ايش", "ماذا", "مطلوب", "حل", "حله",
+        "اول", "الاول", "ثاني", "الثاني", "ثالث", "الثالث", "رابع", "الرابع",
+        "خامس", "الخامس", "سادس", "السادس", "سابع", "السابع", "ثامن", "الثامن",
+        "تاسع", "التاسع", "عاشر", "العاشر", "جديد", "حاليا", "تسليم", "تسليمه",
+    }
+    return not any(token in blocked for token in tokens)
+
+
+def get_fast_conversation_response(user_input):
+    """Return only cheap, side-effect-free social/control replies.
+
+    Telegram may call this while a heavier agent turn is still running, so this
+    helper must never touch Moodle, Ollama, or mutable result-selection state.
+    """
     if _is_simple_greeting(user_input):
         return "مرحبا أخوي 👋 كيف فيني أساعدك اليوم؟"
     if _is_social_goodbye(user_input):
@@ -4394,51 +4872,299 @@ def _conversation_control(user_input):
         return "تمام أخوي 👌"
     if _is_agent_identity_question(user_input):
         return _agent_identity_response()
+    if _is_monitoring_capability_question(user_input):
+        return _monitoring_capability_response()
+    return None
+
+
+def _conversation_control(user_input):
+    """Cheap deterministic layer that runs before semantic/course routing."""
+    fast_response = get_fast_conversation_response(user_input)
+    if fast_response is not None:
+        return fast_response
     if _is_whats_new_question(user_input):
         return ("بقدر أتفقد الوضع الحالي، بس حتى أحكيلك شو «الجديد» بالضبط لازم يكون عندي "
                 "سجل مقارنة من آخر فحص. هاي رح تصير تلقائية مع المراقبة 24/7؛ حاليًا اسألني عن "
                 "الواجبات أو الكويزات أو الحضور الحالي وبفحصهم مباشرة.")
-    last_resource = _handle_last_course_resource_followup(user_input)
-    if last_resource is not None:
-        return last_resource
+    selected_resource = _handle_course_resource_selection_followup(user_input)
+    if selected_resource is not None:
+        return selected_resource
     filtered = _handle_course_resource_filter_followup(user_input)
     if filtered is not None:
         return filtered
     return None
 
 
+def _message_may_define_future_action(user_input):
+    """Broad grammar gate for future-condition requests.
+
+    This is not a university-intent classifier.  It only notices that the turn
+    describes a future trigger/reaction, so the Agent Core gets a chance to
+    understand the actual condition and requested action structurally.
+    """
+    text = normalize_text(user_input)
+    condition_markers = [
+        "اذا ", "لو ", "اول ما", "لما ", "عندما ", "وقت ما", "بس ",
+        "when ", "if ", "once ",
+    ]
+    reaction_markers = [
+        "خبرني", "بلغني", "نبهني", "ذكرني", "راقب", "اعمل", "سوي",
+        "نفذ", "ابعثلي", "ارسللي", "tell me", "notify", "remind", "monitor",
+    ]
+    return any(marker in text for marker in condition_markers) and any(
+        marker in text for marker in reaction_markers
+    )
+
+
+def _build_high_confidence_future_watch(user_input):
+    """Compile an obvious future watch request without calling the LLM.
+
+    This operates on semantic capability classes, not sentence templates.  The
+    local semantic layer identifies the university entity (assignment, quiz,
+    attendance, deadline), while course identity is resolved against Moodle.
+    Ambiguous future requests still fall through to Agent Core.
+    """
+    if not _message_may_define_future_action(user_input):
+        return None
+
+    fast = _fast_semantic_analysis(user_input)
+    intents = list(fast.get("intents") or [])
+
+    trigger_by_intent = {
+        "assignments": "assignment_added",
+        "assignment_details": "assignment_added",
+        "assignment_files": "assignment_added",
+        "assignment_submission": "assignment_added",
+        "solve_assignment": "assignment_added",
+        "quizzes": "quiz_added",
+        "quiz_grades": "quiz_added",
+        "attendance": "attendance_opened",
+        "deadlines": "deadline_near",
+    }
+
+    trigger_type = None
+    for intent in intents:
+        if intent in trigger_by_intent:
+            trigger_type = trigger_by_intent[intent]
+            break
+
+    if not trigger_type:
+        return None
+
+    course_ref = None
+    filters = {}
+    try:
+        courses = load_courses()
+        matches = _learned_course_matches(user_input, courses) or deterministic_course_matches(
+            user_input, courses
+        )
+        if len(matches) == 1:
+            course_ref = get_course_name(matches[0])
+            filters["course_ref"] = course_ref
+    except Exception as exc:
+        print(f"[DEBUG] Future watch course resolution skipped: {exc}")
+
+    return AgentDecision(
+        action="watch",
+        tool=None,
+        course_ref=course_ref,
+        refresh=False,
+        response_goal="monitor the future university event and react when it occurs",
+        clarification="",
+        confidence=0.99,
+        reason="high_confidence_future_watch_from_semantic_intent",
+        answer="",
+        trigger_type=trigger_type,
+        event_filters=filters,
+        requested_action="notify",
+        notify=True,
+    )
+
+
+def register_external_event(event_type, payload=None):
+    """Public bridge for monitor.py/attendance_monitor.py.
+
+    Phase 2 stores the event and returns any matching pending actions.  The next
+    integration phase can execute/notify from this result without changing the
+    conversation model.
+    """
+    return _event_state.record_event(event_type, payload or {})
+
+
+def get_event_state_snapshot():
+    return _event_state.snapshot()
+
+
+def _register_watch_from_decision(user_input, decision):
+    filters = dict(decision.event_filters or {})
+    # Canonicalize course references when possible so future monitor events match
+    # by stable Moodle course_id instead of by the wording the student used.
+    ref = decision.course_ref or filters.get("course_ref")
+    if ref:
+        try:
+            courses = load_courses()
+            matches = _learned_course_matches(ref, courses) or deterministic_course_matches(ref, courses)
+            if len(matches) == 1:
+                filters.pop("course_ref", None)
+                filters["course_id"] = get_course_id(matches[0])
+                filters["course_name"] = get_course_name(matches[0])
+            elif not filters.get("course_name"):
+                filters["course_ref"] = ref
+        except Exception:
+            filters.setdefault("course_ref", ref)
+    pending = _event_state.add_pending_action(
+        trigger_type=decision.trigger_type,
+        filters=filters,
+        requested_action=decision.requested_action or "notify",
+        notify=decision.notify,
+        original_request=user_input,
+    )
+    trigger = pending.get("trigger_type", "الحدث")
+    if filters:
+        readable_filters = ", ".join(f"{k}={v}" for k, v in filters.items())
+        return f"تمام، حفظت الطلب. رح أراقب {trigger} ({readable_filters}) وأنفذ المطلوب لما يصير."
+    return f"تمام، حفظت الطلب. رح أراقب {trigger} وأنفذ المطلوب لما يصير."
+
+
+def _should_consult_agent_core(user_input):
+    """Send only genuinely ambiguous/open language through the LLM planner.
+
+    Clear tool commands keep the proven deterministic fast path.  The planner is
+    for turns whose meaning depends on state, freshness, advice or discourse.
+    """
+    if _message_may_define_future_action(user_input):
+        return True
+    fast = _fast_semantic_analysis(user_input)
+    if fast.get("intents"):
+        return False
+    # Explicit course-only turns are deterministic state changes, not reasoning.
+    if is_course_only_message(user_input):
+        return False
+    return True
+
+
+def _run_agent_core(user_input):
+    """Plan one turn and execute only validated high-level actions.
+
+    Returns None when the legacy executor should continue.
+    """
+    if not _should_consult_agent_core(user_input):
+        return None
+
+    state = _grounded_state_payload()
+    future_condition_hint = _message_may_define_future_action(user_input)
+
+    # Obvious future watches are compiled from the grounded semantic layer first.
+    # This prevents a small local model from turning a clear watch into course_info
+    # or an empty clarification, and avoids a 20-60 second planner round-trip.
+    decision = _build_high_confidence_future_watch(user_input) if future_condition_hint else None
+    if decision is not None:
+        print(f"[DEBUG] Fast future-watch decision: {decision.to_dict()}")
+    else:
+        # Tests and runtime may replace ollama.chat dynamically; always use the
+        # currently active callable instead of a stale function captured at import.
+        _agent_core.chat_fn = ollama.chat
+        decision = _agent_core.plan(
+            user_input,
+            state,
+            future_condition_hint=future_condition_hint,
+        )
+        print(f"[DEBUG] Agent Core decision: {decision.to_dict()}")
+
+    # A future-condition turn must never accidentally execute an immediate Moodle
+    # lookup just because the planner noticed words such as course/assignment.
+    # Retry the planner once with the same structural hint. This path is rare and
+    # intentionally favors correctness over latency for automation requests.
+    if future_condition_hint and decision.action not in {"watch", "clarify"}:
+        print(
+            "[DEBUG] Future-action routing conflict; retrying Agent Core with "
+            "future-condition constraint."
+        )
+        decision = _agent_core.plan(
+            user_input,
+            state,
+            future_condition_hint=True,
+        )
+        print(f"[DEBUG] Agent Core retry decision: {decision.to_dict()}")
+        if decision.action not in {"watch", "clarify"}:
+            return (
+                "فهمت إنك بدك مني أراقب شرط بالمستقبل وأتصرف لما يصير، "
+                "بس ما قدرت أحدد الشرط بشكل موثوق. وضحلي شو الحدث اللي بدك "
+                "أراقبه وشو أعمل لما يصير."
+            )
+
+    # Low-confidence model output is never allowed to override proven routing.
+    if decision.confidence and decision.confidence < 0.55:
+        return None
+
+    if decision.action == "respond":
+        if decision.answer:
+            return decision.answer
+        if _has_grounded_state():
+            return _state_aware_general_response(user_input)
+        return general_ai_response(user_input)
+
+    if decision.action == "clarify":
+        return decision.clarification or "وضحلي المقصود شوي عشان أنفذ الطلب الصح."
+
+    if decision.action == "watch":
+        return _register_watch_from_decision(user_input, decision)
+
+    if decision.action == "tool" and decision.tool:
+        # Tool execution stays deterministic/grounded.  The LLM only selected
+        # the capability; it never fabricates the university result.
+        tool_input = user_input
+        if decision.course_ref and normalize_text(decision.course_ref) not in normalize_text(user_input):
+            tool_input = f"{user_input} مادة {decision.course_ref}"
+        result = run_single_intent(decision.tool, tool_input)
+        if result:
+            return result
+        return None
+
+    return None
+
+
 # MAIN PROCESSOR
 
 
-def process_user_message(
-    user_input
-):
+def process_user_message(user_input):
     user_input = user_input.strip()
     if not user_input:
         return "اكتبلي سؤالك."
-    # --------------------------------------------------------
     # Fast conversation control: never wake Moodle/Ollama for greetings,
     # identity/capability intros, or refinements of an existing result set.
-    # --------------------------------------------------------
     control_response = _conversation_control(user_input)
     if control_response is not None:
         return control_response
-    # --------------------------------------------------------
-    # Explicit persistent teaching / learned-rule management
-    # --------------------------------------------------------
+
+    # Explicit teaching/management is an explicit control command and therefore
+    # outranks any active assignment/quiz state.
     learning_response = _handle_learning_management(user_input)
     if learning_response is not None:
         return learning_response
 
-    # --------------------------------------------------------
+    # Meta/capability questions describe what the agent CAN do; they are not
+    # commands to act on the currently selected entity.
+    capability = _maybe_answer_capability_question(user_input)
+    if capability is not None:
+        return capability
+
+    # V5 Agent Core: natural/open-ended turns are planned from grounded state
+    # before the legacy phrase-oriented follow-up machinery.
+    core_response = _run_agent_core(user_input)
+    if core_response is not None:
+        return core_response
+
+    # Grounded state wins over semantic/course inference for actual actions.
+    state_response = _state_first_followup(user_input)
+    if state_response is not None:
+        return state_response
+
     # Pending course clarification / active learning
-    # --------------------------------------------------------
     pending_answer = _handle_pending_course_answer(user_input)
     if pending_answer is not None:
         return pending_answer
-    # --------------------------------------------------------
     # Exit
-    # --------------------------------------------------------
     if normalize_text(
         user_input
     ) in [
@@ -4447,15 +5173,7 @@ def process_user_message(
         "خروج",
     ]:
         return "__EXIT__"
-    # --------------------------------------------------------
-    # Output constraint / capability question (separate from intent routing)
-    # --------------------------------------------------------
-    capability = _maybe_answer_capability_question(user_input)
-    if capability is not None:
-        return capability
-    # --------------------------------------------------------
     # Contextual follow-up FIRST
-    # --------------------------------------------------------
     contextual_response = (
         handle_contextual_follow_up(
             user_input
@@ -4463,9 +5181,7 @@ def process_user_message(
     )
     if contextual_response:
         return contextual_response
-    # --------------------------------------------------------
     # Intent inheritance vs. course-only selection
-    # --------------------------------------------------------
     # A short turn such as "والحوسبة كمان" names a NEW course but normally
     # inherits the previous action. Decide that locally BEFORE course-only
     # handling, otherwise the phrase gets swallowed as a mere course selection.
@@ -4474,25 +5190,35 @@ def process_user_message(
     reference = _extract_course_reference(user_input)
     quick = _fast_semantic_analysis(user_input)
     inherited_intent = None
+
+    # Intent inheritance is allowed only when the new short turn actually resolves
+    # to a known Moodle course. A leftover conversational word such as "بحكي"
+    # must never inherit course_files/assignments merely because an old intent exists.
+    explicit_course_matches = []
+    if reference and len(reference.split()) <= 4:
+        current_courses = load_courses()
+        explicit_course_matches = _learned_course_matches(reference, current_courses)
+        if not explicit_course_matches:
+            explicit_course_matches = deterministic_course_matches(reference, current_courses)
     if (
         previous_intent in inheritable
-        and reference
-        and len(reference.split()) <= 4
+        and explicit_course_matches
         and not quick.get("intents")
     ):
         inherited_intent = previous_intent
 
-    # --------------------------------------------------------
     # Course-only
-    # --------------------------------------------------------
     if inherited_intent is None and is_course_only_message(user_input):
         response = handle_course_only(user_input)
         if response:
             return response
 
-    # --------------------------------------------------------
+    # Open-ended conversational turns are interpreted by the LLM WITH grounded
+    # state, rather than by an ever-growing list of phrase-specific if/else rules.
+    if inherited_intent is None and _should_use_state_reasoner(user_input):
+        return _state_aware_general_response(user_input)
+
     # Detect intents
-    # --------------------------------------------------------
     if inherited_intent is not None:
         intents = [inherited_intent]
         print(f"[DEBUG] Inherited previous intent: {inherited_intent}")
@@ -4502,29 +5228,14 @@ def process_user_message(
     print(
         f"[DEBUG] Detected intents: {intents}"
     )
-    # --------------------------------------------------------
     # No university intent
-    # --------------------------------------------------------
     if not intents:
-        # Never hand a university-context follow-up to the free-form LLM.
-        # If we already have a Moodle entity/course selected, an ambiguous
-        # follow-up must stay grounded instead of inventing university facts.
-        if (
-            (_last_context.get("selected_item") or _last_context.get("course_id"))
-            and is_contextual_message(user_input)
-        ):
-            return (
-                "فهمت إن سؤالك متعلق بالسياق الجامعي الحالي، لكن البيانات/النية "
-                "مش واضحة كفاية حتى أجاوب من Moodle بدون تخمين. وضحلي شو المعلومة "
-                "اللي بدك إياها عن العنصر الحالي."
-            )
-        # Normal non-university conversation may use the general model.
+        if _has_grounded_state():
+            return _state_aware_general_response(user_input)
         return general_ai_response(
             user_input
         )
-    # --------------------------------------------------------
     # Selected-item intents have priority
-    # --------------------------------------------------------
     selected_priority = [
         "selected_grade",
         "assignment_files",
@@ -4541,9 +5252,7 @@ def process_user_message(
             )
             if result:
                 return result
-    # --------------------------------------------------------
     # Multi-intent
-    # --------------------------------------------------------
     normal_intents = [
         intent
         for intent in intents
@@ -4556,9 +5265,7 @@ def process_user_message(
         )
         if result:
             return result
-    # --------------------------------------------------------
     # Single intent
-    # --------------------------------------------------------
     # Reuse the intent we already resolved above. Calling the semantic router a
     # second time here can lose inherited intents and needlessly invoke Ollama.
     primary = normal_intents[0] if len(normal_intents) == 1 else detect_primary_intent(user_input)
@@ -4566,9 +5273,7 @@ def process_user_message(
         result = run_single_intent(primary, user_input)
         if result:
             return result
-    # --------------------------------------------------------
     # Safe fallback
-    # --------------------------------------------------------
     return (
         "فهمت إنك بتسأل عن معلومات جامعية، "
         "بس مش قادر أحدد المطلوب بالضبط. "
@@ -4598,7 +5303,7 @@ def enforce_response_style(user_input, response):
 
 def main():
     print("=" * 60)
-    print("University AI Agent V3")
+    print("University AI Agent V5 - Agent Core Phase 1")
     print("=" * 60)
     print(
         "Moodle + Local Ollama"

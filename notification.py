@@ -35,10 +35,11 @@ INITIAL_RETRY_DELAY = 2
 # ============================================================
 
 NOTIFICATION_PRIORITIES = {
-    "NEW_ASSIGNMENT": "NORMAL",
+    "NEW_ASSIGNMENT": "HIGH",
     "ASSIGNMENT_CHANGED": "NORMAL",
     "NEW_QUIZ": "HIGH",
     "QUIZ_CHANGED": "NORMAL",
+    "ATTENDANCE_OPENED": "HIGH",
     "ATTENDANCE_CHANGED": "HIGH"
 }
 
@@ -129,6 +130,10 @@ def format_notification(
     elif notification_type == "QUIZ_CHANGED":
 
         title = "🔄 Quiz Updated"
+
+    elif notification_type == "ATTENDANCE_OPENED":
+
+        title = "✅ Attendance Opened"
 
     elif notification_type == "ATTENDANCE_CHANGED":
 
