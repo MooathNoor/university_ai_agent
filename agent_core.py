@@ -181,7 +181,14 @@ Rules:
 - Use clarify only if a necessary trigger/reference cannot be resolved safely.
 - Never invent an event that already happened.
 - course_ref should be the course phrase explicitly/reliably referenced, or null.
-- requested_action should usually be notify when the student only wants to be told.
+- requested_action must preserve what the student actually wants to happen.
+- Use requested_action=notify only when the student merely wants a notification.
+- For a state-changing request, return a concise structural action name instead of
+  downgrading it to notify. Example: register_attendance for a request to mark the
+  student's attendance when attendance opens.
+- Planning a state-changing action does NOT authorize or execute it. Runtime policy,
+  current authorization/presence requirements, execution, and fresh verification
+  are handled separately.
 - Good structural triggers include assignment_added, quiz_added, attendance_opened, deadline_near.
 
 Return this schema:
@@ -197,7 +204,7 @@ Return this schema:
   "answer": "",
   "trigger_type": null or "structural_event_name",
   "event_filters": {{"course_ref": "optional course reference"}},
-  "requested_action": "notify",
+  "requested_action": "notify or a concise structural requested action",
   "notify": true
 }}
 

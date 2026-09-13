@@ -3,7 +3,7 @@ import time
 import re
 
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs
 
 from lms_client import (
     login,
@@ -121,6 +121,132 @@ def get_course_display_name(course):
 # ATTENDANCE
 # ============================================================
 
+def _safe_attendance_control_url(url):
+    """Return a read-only diagnostic URL without leaking query-string secrets."""
+    if not url:
+        return ""
+    parsed = urlparse(str(url))
+    if not parsed.scheme and not parsed.netloc:
+        path = parsed.path
+    else:
+        path = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    keys = sorted(parse_qs(parsed.query, keep_blank_values=True).keys())
+    if keys:
+        return f"{path}?fields={','.join(keys)}"
+    return path
+
+
+def _parse_attendance_discovery(attendance_soup, attendance_url):
+    """Inspect attendance HTML without submitting anything.
+
+    The result intentionally records only structural evidence: form methods,
+    endpoint paths, field names and human-visible labels. Token VALUES are never
+    returned. The function never performs POST requests.
+    """
+    controls = []
+    open_evidence = []
+    closed_evidence = []
+
+    positive_labels = (
+        "submit attendance", "mark attendance", "record attendance",
+        "take attendance", "self attendance", "تسجيل الحضور", "سجل حضور",
+    )
+    closed_labels = (
+        "closed", "not available", "not open", "no sessions available",
+        "غير متاح", "مغلق",
+    )
+
+    for form in attendance_soup.find_all("form"):
+        method = str(form.get("method") or "get").strip().upper()
+        action = urljoin(attendance_url, form.get("action") or attendance_url)
+        field_names = sorted({
+            str(field.get("name")).strip()
+            for field in form.find_all(["input", "select", "textarea"])
+            if field.get("name")
+        })
+        labels = [
+            str(x.get("value") or x.get_text(" ", strip=True) or "").strip()
+            for x in form.find_all(["button", "input"])
+            if str(x.get("type") or "").lower() in {"submit", "button", ""}
+        ]
+        label_text = " ".join(x for x in labels if x)
+        structure = {
+            "kind": "form",
+            "method": method,
+            "action": _safe_attendance_control_url(action),
+            "field_names": field_names,
+            "labels": [x for x in labels if x],
+        }
+        lowered = f"{label_text} {action}".lower()
+        relevant = (
+            "attendance" in lowered
+            or "sessid" in field_names
+            or "sessionid" in field_names
+            or any(label in lowered for label in positive_labels)
+        )
+        if relevant:
+            controls.append(structure)
+            if any(label in lowered for label in positive_labels):
+                open_evidence.append(f"form:{label_text or structure['action']}")
+
+    for link in attendance_soup.find_all("a", href=True):
+        href = urljoin(attendance_url, link.get("href", ""))
+        text = link.get_text(" ", strip=True)
+        lowered = f"{text} {href}".lower()
+        parsed = urlparse(href)
+        query_keys = sorted(parse_qs(parsed.query, keep_blank_values=True).keys())
+        looks_actionable = (
+            any(label in lowered for label in positive_labels)
+            or (
+                "/mod/attendance/" in parsed.path.lower()
+                and parsed.path.lower().endswith("attendance.php")
+                and any(k in query_keys for k in ("sessid", "sessionid"))
+            )
+        )
+        if looks_actionable:
+            controls.append({
+                "kind": "link",
+                "method": "GET",
+                "action": _safe_attendance_control_url(href),
+                "field_names": query_keys,
+                "labels": [text] if text else [],
+            })
+            open_evidence.append(f"link:{text or parsed.path}")
+
+    page_text = attendance_soup.get_text(" ", strip=True).lower()
+    for marker in closed_labels:
+        if marker in page_text:
+            closed_evidence.append(marker)
+
+    if open_evidence:
+        activity_state = "Open"
+    elif closed_evidence:
+        activity_state = "Closed"
+    else:
+        activity_state = "Unknown"
+
+    # Deduplicate structural controls while preserving order.
+    unique_controls = []
+    seen = set()
+    for control in controls:
+        key = (
+            control.get("kind"), control.get("method"), control.get("action"),
+            tuple(control.get("field_names") or []), tuple(control.get("labels") or []),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_controls.append(control)
+
+    return {
+        "activity_state": activity_state,
+        "attendance_url": _safe_attendance_control_url(attendance_url),
+        "controls": unique_controls,
+        "open_evidence": open_evidence,
+        "closed_evidence": closed_evidence,
+        "read_only": True,
+    }
+
 def get_attendance(course_name):
     """
     Get real attendance data from Moodle.
@@ -219,6 +345,11 @@ def get_attendance(course_name):
         "html.parser"
     )
 
+    discovery = _parse_attendance_discovery(
+        attendance_soup,
+        attendance_link,
+    )
+
     summary = {}
 
     summary_table = attendance_soup.select_one("table.attlist")
@@ -257,6 +388,9 @@ def get_attendance(course_name):
         "course_id": course_id,
         "summary": summary,
         "sessions": sessions,
+        "activity_state": discovery.get("activity_state", "Unknown"),
+        "attendance_url": discovery.get("attendance_url", ""),
+        "discovery": discovery,
     }
 
 
@@ -1153,6 +1287,39 @@ def _inspect_assignment_submission(item):
     if any(marker in text for marker in submitted_markers):
         return "done"
     return "unknown"
+
+
+def get_assignment_submission_status(assignment):
+    """Verify one assignment's submission state from Moodle.
+
+    Returns a small grounded result for the currently referenced assignment.
+    This deliberately reuses the same conservative checker used by
+    ``get_pending_work`` so a single-assignment question and the global pending
+    scan cannot disagree because of separate parsing rules.
+    """
+    if not isinstance(assignment, dict):
+        return {
+            "status": "Error",
+            "state": "unknown",
+            "message": "Invalid assignment data.",
+        }
+
+    if not login():
+        return {
+            "status": "Error",
+            "state": "unknown",
+            "message": "Could not authenticate with Moodle.",
+        }
+
+    state = _inspect_assignment_submission(assignment)
+    return {
+        "status": "Success" if state in {"done", "pending"} else "Unknown",
+        "state": state,
+        "name": assignment.get("name", ""),
+        "course": assignment.get("course_name") or assignment.get("course", ""),
+        "course_id": assignment.get("course_id"),
+        "url": assignment.get("url", ""),
+    }
 
 
 def _inspect_quiz_attempt(item):

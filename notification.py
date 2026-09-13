@@ -40,7 +40,8 @@ NOTIFICATION_PRIORITIES = {
     "NEW_QUIZ": "HIGH",
     "QUIZ_CHANGED": "NORMAL",
     "ATTENDANCE_OPENED": "HIGH",
-    "ATTENDANCE_CHANGED": "HIGH"
+    "ATTENDANCE_CHANGED": "HIGH",
+    "REMINDER": "HIGH"
 }
 
 
@@ -138,6 +139,10 @@ def format_notification(
     elif notification_type == "ATTENDANCE_CHANGED":
 
         title = "⚠️ Attendance Update"
+
+    elif notification_type == "REMINDER":
+
+        title = "⏰ Important Reminder"
 
     else:
 

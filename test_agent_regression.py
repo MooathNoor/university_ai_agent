@@ -114,6 +114,9 @@ def load_agent():
     fake_tools.get_quiz_grades = _fake_quiz_grades
     fake_tools.get_upcoming_deadlines = lambda: []
     fake_tools.get_pending_work = lambda: {"status": "Success", "has_pending": False, "pending": []}
+    fake_tools.get_assignment_submission_status = lambda assignment: {
+        "status": "Success", "state": "done", "name": assignment.get("name", "")
+    }
     fake_tools.get_cached_courses = lambda: COURSES
     fake_tools.get_course_name = _course_name
     fake_tools.get_course_id = _course_id
@@ -469,6 +472,34 @@ def run():
         f"future assignment watch was not canonicalized to Cloud course 1194: {pending}",
     )
 
+    # Natural "in case" grammar + all-course scope must also compile to one
+    # watch, without querying current quizzes or pinning the action to one course.
+    m._event_state.reset()
+    rr = m.process_user_message("طيب بدي تراقب كل المواد في حال نزل كويز جديد بدي تبلغني مباشرة")
+    check("حفظت الطلب" in rr, f"all-course quiz watch was not registered: {rr}")
+    pending = m.get_event_state_snapshot().get("pending_actions", [])
+    all_quiz_watch = [x for x in pending if x.get("trigger_type") == "quiz_added"]
+    check(len(all_quiz_watch) == 1, f"all-course quiz watch missing/duplicated: {pending}")
+    check(not (all_quiz_watch[0].get("filters") or {}), f"all-course watch incorrectly pinned to a course: {all_quiz_watch}")
+
+    # A generic future watch with no course name means any enrolled course rather
+    # than inheriting a stale active course from conversation state.
+    m._event_state.reset()
+    rr = m.process_user_message("بدي تراقب وفي حال نزل كويز جديد تبلغني مباشرة")
+    check("حفظت الطلب" in rr, f"generic quiz watch was not registered: {rr}")
+    pending = m.get_event_state_snapshot().get("pending_actions", [])
+    generic_quiz_watch = [x for x in pending if x.get("trigger_type") == "quiz_added"]
+    check(len(generic_quiz_watch) == 1, f"generic quiz watch missing/duplicated: {pending}")
+    check(not (generic_quiz_watch[0].get("filters") or {}), f"generic watch inherited a stale course: {generic_quiz_watch}")
+
+    # Grounded correction follow-ups must beat Agent Core. The user does not need
+    # to repeat the word "file" when the active result set is already resources.
+    m.clear_context()
+    rr = m.process_user_message("بدي ترسلي ملفات ماده التحليل العددي كلهم")
+    check("Unit 6.pdf" in rr and "Lecture meeting" in rr, f"resource correction setup failed: {rr}")
+    rr = m.process_user_message("قلتلك بدي الاول بس")
+    check("Unit 6.pdf" in rr and "Lecture meeting" not in rr, f"resource correction did not use grounded state first: {rr}")
+
     # Submission-state requests are a distinct cross-course intent. They must go
     # to pending_work directly instead of running assignments/quizzes separately.
     m.clear_context()
@@ -492,6 +523,18 @@ def run():
     rr = m.process_user_message("كم كانت مدته؟")
     check("5 mins" in rr, f"selected quiz duration did not stay in state: {rr}")
 
+    # Submission-status follow-ups on a selected assignment are grounded and local.
+    # They must not wake the planner, rescan all assignments, or confuse status
+    # verification with a "how do I submit" question.
+    m.clear_context()
+    rr = m.process_user_message("بدي ترسلي اول واجب من مادة الحوسبة")
+    check("Public vs Private Assignment" in rr, f"Cloud first-assignment setup failed: {rr}")
+    rr = m.process_user_message("هل تم تسليمة؟")
+    check(rr.startswith("اه") and "تم تسليمه" in rr, f"short submission-status follow-up failed: {rr}")
+    rr = m.process_user_message("هل هاض الواجب تم تسليمه؟")
+    check(rr.startswith("اه") and "تم تسليمه" in rr, f"explicit submission-status follow-up failed: {rr}")
+    check(m._active_entity_item("assignment").get("name") == "Public vs Private Assignment", "submission check lost selected assignment context")
+
     # An explicit course mention must outrank a stale resource result set.
     m.clear_context()
     rr = m.process_user_message("هات ملفات مادة التحليل العددي")
@@ -505,7 +548,7 @@ def run():
     rr = m.process_user_message("مين الدكتور تبع مادة الحوسبة السحابيه شو اسمه")
     check("مش موجود ضمن البيانات" in rr, f"missing instructor was not reported honestly: {rr}")
 
-    print("PASS: 118 regression assertions")
+    print("PASS: 131 regression assertions")
 
 
 if __name__ == "__main__":

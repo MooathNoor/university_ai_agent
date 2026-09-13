@@ -105,7 +105,7 @@ def test_monitor_handlers(tmpdir):
 
     sent = []
 
-    def fake_execute(action_type, message, channel=None):
+    def fake_execute(action_type, message, channel=None, event_result=None):
         sent.append(
             {
                 "type": action_type,

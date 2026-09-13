@@ -18,6 +18,7 @@ from tools import (
     get_quiz_grades,
     get_upcoming_deadlines,
     get_pending_work,
+    get_assignment_submission_status,
     get_cached_courses,
     get_course_name,
     get_course_id,
@@ -3475,6 +3476,9 @@ def _force_refresh_requested(user_input):
     return contains_any(text, [
         "تاكد", "تأكد", "ارجع تاكد", "ارجع تأكد", "افحص", "تفقد",
         "حدث", "حدّث", "جديد", "جديده", "جديدة", "new",
+        "هسا", "هسه", "حاليا", "حاليًا", "الان", "الآن", "بهاللحظه", "بهاللحظة",
+        "هل فتح", "فاتح هسا", "مفتوح هسا",
+        "now", "right now", "currently", "today",
         "refresh", "check again", "recheck",
     ])
 
@@ -4698,6 +4702,64 @@ def _selection_from_last_result(user_input):
     return f"{name}" + ("\n" + str(url) if url else "")
 
 
+def _is_assignment_submission_status_question(user_input):
+    """Recognize verification of the selected assignment's submission state.
+
+    This is intentionally about *whether it was submitted*, not *how to submit
+    it*.  The entity itself comes from grounded conversation state.
+    """
+    text = normalize_text(user_input).strip(" .,!؟?")
+    if not text:
+        return False
+
+    # Procedure questions belong to the existing assignment_submission handler.
+    if contains_any(text, [
+        "كيف اسلم", "كيف اسلمه", "كيف اسلمها", "طريقه التسليم",
+        "طريقة التسليم", "نوع التسليم", "وين اسلم", "where to submit",
+        "how to submit",
+    ]):
+        return False
+
+    submit_markers = [
+        "تم تسليمه", "تم تسليمة", "تم تسليمها", "تم التسليم",
+        "تسلم", "تسليمه", "تسليمة", "سلمته", "سلمتها",
+        "انرفع", "مرفوع", "submitted", "submission status",
+    ]
+    has_submit_language = contains_any(text, submit_markers)
+    has_verification_language = (
+        text.startswith("هل ")
+        or contains_any(text, [
+            "تم " , "ولا لا", "او لا", "متاكد", "تأكد", "تاكد",
+            "did ", "is it", "was it",
+        ])
+    )
+    return bool(has_submit_language and has_verification_language)
+
+
+def _answer_assignment_submission_status(assignment, user_input):
+    result = get_assignment_submission_status(assignment)
+    state = result.get("state") if isinstance(result, dict) else "unknown"
+
+    save_context(
+        intent="assignment_submission",
+        tool_name="get_assignment_submission_status",
+        entity_type="assignment",
+        selected_item=assignment,
+        selected_items=[assignment],
+        course_name=assignment.get("course_name") or assignment.get("course"),
+        course_id=assignment.get("course_id"),
+        raw_result=result,
+        display_result=result,
+        user_input=user_input,
+    )
+
+    if state == "done":
+        return "اه، حسب Moodle هاض الواجب تم تسليمه."
+    if state == "pending":
+        return "لا، حسب Moodle هاض الواجب لسا ما تم تسليمه."
+    return "ما قدرت أتأكد من حالة تسليم هاض الواجب من Moodle حاليًا، فما رح أفترض نعم أو لا."
+
+
 def _grounded_assignment_followup(user_input):
     """Handle natural follow-ups on the currently selected assignment locally."""
     assignment = _active_entity_item("assignment")
@@ -4707,6 +4769,11 @@ def _grounded_assignment_followup(user_input):
         return None
 
     text = normalize_text(user_input).strip(" .,!؟?")
+
+    # Submission-state verification is a grounded factual follow-up. It must be
+    # answered from Moodle directly before Agent Core or broad assignment routing.
+    if _is_assignment_submission_status_question(user_input):
+        return _answer_assignment_submission_status(assignment, user_input)
 
     # File/attachment request.
     if _is_assignment_file_followup(user_input):
@@ -4896,24 +4963,67 @@ def _conversation_control(user_input):
 
 
 def _message_may_define_future_action(user_input):
-    """Broad grammar gate for future-condition requests.
+    """Detect future/event-driven requests using grammar, not exact sentences.
 
-    This is not a university-intent classifier.  It only notices that the turn
-    describes a future trigger/reaction, so the Agent Core gets a chance to
-    understand the actual condition and requested action structurally.
+    A future action normally contains a reaction (monitor/notify/do something) and
+    either an explicit conditional connector (if/when/in case) or a clear change
+    event (new item appears, attendance opens, deadline approaches).  This keeps
+    ordinary immediate requests such as "هات الكويزات" out of the watch path while
+    allowing natural variants such as "في حال نزل..." or "راقب أي كويز جديد".
     """
     text = normalize_text(user_input)
     condition_markers = [
-        "اذا ", "لو ", "اول ما", "لما ", "عندما ", "وقت ما", "بس ",
-        "when ", "if ", "once ",
+        "اذا ", "لو ", "اول ما", "لما ", "عندما ", "وقت ما",
+        "في حال", "بحال", "حال ما", "when ", "if ", "once ",
+        "in case",
     ]
     reaction_markers = [
-        "خبرني", "بلغني", "نبهني", "ذكرني", "راقب", "اعمل", "سوي",
-        "نفذ", "ابعثلي", "ارسللي", "tell me", "notify", "remind", "monitor",
+        # Read-only / notification reactions.
+        "خبرني", "بلغني", "نبهني", "ذكرني", "راقب", "تابع",
+        "ابعثلي", "ارسللي", "tell me", "notify", "remind",
+        "monitor", "watch",
+        # State-changing reactions. These only make the message a future-action
+        # request; they are NOT executed by the fast watch path below.
+        "اعمل", "سوي", "نفذ", "سجل", "سجّل", "سلم", "سلّم",
+        "submit", "register", "mark", "complete", "execute",
     ]
-    return any(marker in text for marker in condition_markers) and any(
-        marker in text for marker in reaction_markers
-    )
+    future_event_markers = [
+        "جديد", "ينزل", "نزل", "يضاف", "انضاف", "يظهر", "ظهر",
+        "يفتح", "فتح", "يتفعل", "تفعل", "يقرب", "اقترب", "يتغير",
+        "تغير", "new", "added", "opens", "becomes available", "changes",
+    ]
+
+    has_reaction = any(marker in text for marker in reaction_markers)
+    if not has_reaction:
+        return False
+    has_condition = any(marker in text for marker in condition_markers)
+    has_future_event = any(marker in text for marker in future_event_markers)
+    return bool(has_condition or has_future_event)
+
+
+def _future_watch_is_notification_only(user_input):
+    """Return True only when a future request is read-only notification/monitoring.
+
+    The fast future-watch compiler is intentionally restricted to read-only
+    reactions.  If the user asks the agent to change Moodle state later (submit,
+    register, mark, execute, etc.), the request must go through Agent Core so the
+    requested action is preserved instead of being silently downgraded to notify.
+    """
+    text = normalize_text(user_input)
+
+    state_change_markers = [
+        "سجل", "سجّل", "سلم", "سلّم", "ارفع", "نفذ", "اعمل", "سوي",
+        "submit", "register", "mark", "complete", "execute", "upload",
+    ]
+    if any(marker in text for marker in state_change_markers):
+        return False
+
+    notification_markers = [
+        "خبرني", "بلغني", "نبهني", "ذكرني", "راقب", "تابع",
+        "ابعثلي", "ارسللي", "tell me", "notify", "remind",
+        "monitor", "watch",
+    ]
+    return any(marker in text for marker in notification_markers)
 
 
 def _build_high_confidence_future_watch(user_input):
@@ -4925,6 +5035,12 @@ def _build_high_confidence_future_watch(user_input):
     Ambiguous future requests still fall through to Agent Core.
     """
     if not _message_may_define_future_action(user_input):
+        return None
+
+    # Never let a state-changing future request be silently compiled as notify.
+    # Those requests must preserve their requested action through Agent Core and
+    # later pass the VerifiedActionRunner execution/verification gate.
+    if not _future_watch_is_notification_only(user_input):
         return None
 
     fast = _fast_semantic_analysis(user_input)
@@ -4953,16 +5069,26 @@ def _build_high_confidence_future_watch(user_input):
 
     course_ref = None
     filters = {}
-    try:
-        courses = load_courses()
-        matches = _learned_course_matches(user_input, courses) or deterministic_course_matches(
-            user_input, courses
-        )
-        if len(matches) == 1:
-            course_ref = get_course_name(matches[0])
-            filters["course_ref"] = course_ref
-    except Exception as exc:
-        print(f"[DEBUG] Future watch course resolution skipped: {exc}")
+
+    # An explicit all-course scope intentionally has NO course filter.  EventState
+    # treats an empty filter set as "match this trigger for any course".  The same
+    # behavior is useful for a generic request such as "راقب أي كويز جديد" when no
+    # single course was named: do not invent a course from stale conversation state.
+    all_course_scope = fast.get("selection") == "all" or bool(fast.get("multiple_courses"))
+    if not all_course_scope:
+        try:
+            courses = load_courses()
+            reference = _extract_course_reference(user_input)
+            matches = []
+            if reference:
+                matches = _learned_course_matches(reference, courses) or deterministic_course_matches(
+                    reference, courses
+                )
+            if len(matches) == 1:
+                course_ref = get_course_name(matches[0])
+                filters["course_ref"] = course_ref
+        except Exception as exc:
+            print(f"[DEBUG] Future watch course resolution skipped: {exc}")
 
     return AgentDecision(
         action="watch",
@@ -4995,6 +5121,402 @@ def get_event_state_snapshot():
     return _event_state.snapshot()
 
 
+def _is_missed_events_question(user_input):
+    """Detect requests for unseen/recent monitor events from persistent state."""
+    text = normalize_text(user_input)
+    missed_markers = [
+        "فاتني", "غايب", "غايب؟", "مش موجود", "ما شفت", "ماشفته",
+        "ما شفته", "شو صار", "ايش صار", "إيش صار", "missed", "while i was away",
+    ]
+    asks_history = contains_any(text, missed_markers)
+    asks_updates = contains_any(text, [
+        "شو", "ايش", "إيش", "اشي", "شي", "صار", "جديد", "تحديث",
+        "فات", "missed", "what", "anything",
+    ])
+    return bool(asks_history and asks_updates)
+
+
+def _is_event_acknowledgement(user_input):
+    """Detect an explicit acknowledgement of a delivered agent event.
+
+    A generic social word such as ``تمام`` is deliberately NOT enough. Telegram
+    confirms delivery, not reading, so the user must explicitly refer to seeing
+    or receiving the notification/event.
+    """
+    text = normalize_text(user_input).strip(" .,!؟?")
+    seen = contains_any(text, [
+        "شفت", "شفته", "شفتها", "قريت", "قريته", "قرأت", "وصلني",
+        "استلمت", "عرفت", "seen", "read it", "got it", "received",
+    ])
+    event_ref = contains_any(text, [
+        "اشعار", "الإشعار", "الاشعار", "تنبيه", "رساله", "رسالة",
+        "الخبر", "الكويز", "الواجب", "الحضور", "event", "notification",
+    ])
+    return bool(seen and event_ref)
+
+
+def _event_readable_label(event_type):
+    labels = {
+        "assignment_added": "نزل واجب جديد",
+        "assignment_changed": "صار تحديث على واجب",
+        "quiz_added": "نزل كويز جديد",
+        "quiz_changed": "صار تحديث على كويز",
+        "attendance_opened": "فتح الحضور",
+        "attendance_changed": "صار تحديث على الحضور",
+        "deadline_near": "موعد تسليم قريب",
+    }
+    return labels.get(str(event_type or ""), str(event_type or "حدث جامعي"))
+
+
+def _format_unacknowledged_events(events):
+    if not events:
+        return "ما عندي أحداث جديدة غير مؤكدة إنك شفتها حاليًا."
+
+    lines = [f"عندك {len(events)} تحديث ما أكدتلي إنك شفته:"]
+    for index, event in enumerate(events[-10:], start=1):
+        payload = event.get("payload") or {}
+        label = _event_readable_label(event.get("type"))
+        course = payload.get("course_name") or payload.get("course")
+        name = payload.get("name")
+        pieces = [f"{index}. {label}"]
+        if name:
+            pieces.append(str(name))
+        if course:
+            pieces.append(f"— {course}")
+        status = event.get("notification_status") or "not_sent"
+        if status == "sent":
+            pieces.append("[تم إرسال التنبيه]")
+        elif status == "failed":
+            pieces.append("[تعذر إرسال التنبيه]")
+        elif status == "skipped_duplicate":
+            pieces.append("[تنبيه مكرر؛ لم يُعد الإرسال]")
+        lines.append(" ".join(pieces))
+    lines.append("إذا شفت آخر تنبيه احكيلي: شفت الإشعار.")
+    return "\n".join(lines)
+
+
+def _presence_confirmation_intent(user_input):
+    """Return True/False only for an explicit real-world presence statement.
+
+    Presence is safety-sensitive. A generic conversational acknowledgement such
+    as ``تمام`` is never enough. We require either an explicit first-person
+    presence phrase or an explicit negative absence phrase.
+    """
+    text = normalize_text(user_input).strip(" .,!؟?")
+
+    negative_markers = [
+        "مش موجود", "مو موجود", "مش بالمحاضره", "مش بالمحاضرة",
+        "مو بالمحاضره", "مو بالمحاضرة", "مش داخل المحاضره",
+        "مش داخل المحاضرة", "انا غايب", "أنا غايب", "مش حاضر",
+        "مو حاضر", "i am not here", "i'm not here", "not in class",
+    ]
+    if contains_any(text, negative_markers):
+        return False
+
+    positive_markers = [
+        "انا موجود", "أنا موجود", "اني موجود", "إني موجود",
+        "انا حاضر", "أنا حاضر", "انا بالمحاضره", "انا بالمحاضرة",
+        "أنا بالمحاضره", "أنا بالمحاضرة", "انا داخل المحاضره",
+        "انا داخل المحاضرة", "أنا داخل المحاضره", "أنا داخل المحاضرة",
+        "موجود بالمحاضره", "موجود بالمحاضرة", "حاضر بالمحاضره",
+        "حاضر بالمحاضرة", "i am here", "i'm here", "i am in class",
+        "i'm in class",
+    ]
+    if contains_any(text, positive_markers):
+        return True
+
+    # A bare yes is accepted only when the agent has exactly one active
+    # presence-confirmation request waiting; the caller enforces that context.
+    bare_yes = {
+        "اه", "آه", "ايوه", "أيوه", "نعم", "يب", "yes", "yeah", "yep",
+    }
+    if text in {normalize_text(x) for x in bare_yes}:
+        return True
+
+    bare_no = {
+        "لا", "لأ", "no", "nope",
+    }
+    if text in {normalize_text(x) for x in bare_no}:
+        return False
+
+    return None
+
+
+def _presence_confirmation_candidates():
+    """Return active presence-sensitive actions tied to an observed event."""
+    snapshot = _event_state.snapshot(max_events=100, max_actions=100)
+    events = {
+        str(event.get("id") or ""): event
+        for event in (snapshot.get("recent_events") or [])
+        if isinstance(event, dict)
+    }
+
+    candidates = []
+    for action in snapshot.get("pending_actions") or []:
+        if not isinstance(action, dict):
+            continue
+        if action.get("status") != "active":
+            continue
+        if action.get("presence_required") is not True:
+            continue
+
+        event_id = str(action.get("last_triggered_event_id") or "").strip()
+        if not event_id:
+            continue
+
+        event = events.get(event_id)
+        if not event:
+            continue
+
+        # Presence confirmation currently has meaning only for a real observed
+        # attendance opening. Never attach it to an unrelated event type.
+        if str(event.get("type") or "") != "attendance_opened":
+            continue
+
+        candidates.append({
+            "action": action,
+            "event": event,
+        })
+
+    candidates.sort(
+        key=lambda item: str((item.get("event") or {}).get("created_at") or ""),
+        reverse=True,
+    )
+    return candidates
+
+
+def _presence_candidate_label(candidate):
+    event = (candidate or {}).get("event") or {}
+    payload = event.get("payload") or {}
+    return str(
+        payload.get("course_name")
+        or payload.get("course")
+        or "المادة المرتبطة بالحضور"
+    )
+
+
+def _select_presence_confirmation_candidate(user_input, candidates):
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    text = normalize_text(user_input)
+    scored = []
+    for candidate in candidates:
+        action = candidate.get("action") or {}
+        event = candidate.get("event") or {}
+        payload = event.get("payload") or {}
+
+        searchable = " ".join([
+            str(payload.get("course_name") or ""),
+            str(payload.get("course") or ""),
+            str(action.get("original_request") or ""),
+        ])
+        normalized_searchable = normalize_text(searchable)
+
+        # Prefer explicit overlap with the course/request wording. Ignore tiny
+        # filler tokens to avoid accidental matches.
+        tokens = [
+            token for token in text.split()
+            if len(token) >= 3 and token not in {
+                "انا", "اني", "موجود", "حاضر", "المحاضره", "المحاضرة",
+                "نعم", "ايوه", "أيوه",
+            }
+        ]
+        score = sum(1 for token in tokens if token in normalized_searchable)
+        if score:
+            scored.append((score, candidate))
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    if len(scored) > 1 and scored[0][0] == scored[1][0]:
+        return None
+    return scored[0][1]
+
+
+def _retry_verified_pending_action(event_id, pending_action_id):
+    """Retry one already-triggered action through monitor's verification gate."""
+    try:
+        from monitor import retry_pending_action_for_event
+        return retry_pending_action_for_event(
+            event_id=event_id,
+            pending_action_id=pending_action_id,
+        )
+    except Exception as error:
+        print(f"[DEBUG] Could not retry verified pending action: {error}")
+        return {
+            "status": "unknown",
+            "message": "تعذر تمرير الطلب إلى بوابة التنفيذ والتحقق.",
+        }
+
+
+def _handle_presence_confirmation_control(user_input):
+    """Bind a truthful presence reply to the exact attendance event.
+
+    This path never invents presence and never treats a generic social response
+    as proof. Once presence is persisted, the SAME pending action/event is
+    retried through Phase 4C's VerifiedActionRunner. Until a real Moodle
+    executor is registered, that retry still fails closed.
+    """
+    candidates = _presence_confirmation_candidates()
+    if not candidates:
+        return None
+
+    intent = _presence_confirmation_intent(user_input)
+    if intent is None:
+        return None
+
+    candidate = _select_presence_confirmation_candidate(
+        user_input,
+        candidates,
+    )
+
+    if candidate is None:
+        labels = []
+        for item in candidates[:5]:
+            label = _presence_candidate_label(item)
+            if label not in labels:
+                labels.append(label)
+
+        readable = "، ".join(labels) if labels else "أكثر من مادة"
+        return (
+            "عندي أكثر من طلب حضور بانتظار تأكيد وجودك، وما بدي أخمّن أي واحد تقصد. "
+            f"حددلي المادة مع جوابك: {readable}."
+        )
+
+    action = candidate.get("action") or {}
+    event = candidate.get("event") or {}
+    action_id = str(action.get("id") or "").strip()
+    event_id = str(event.get("id") or "").strip()
+    course = _presence_candidate_label(candidate)
+
+    if not action_id or not event_id:
+        return "لقيت طلب الحضور، لكن الربط الداخلي للحدث ناقص؛ لذلك ما نفذت أي شيء."
+
+    if intent is False:
+        _event_state.set_pending_action_presence_confirmation(
+            action_id,
+            False,
+            event_id=event_id,
+        )
+        _event_state.acknowledge_event(event_id)
+        return (
+            f"تمام، سجلت إنك مش موجود فعليًا في {course} لهذا الحدث، "
+            "ولذلك ما رح أنفذ تسجيل حضور."
+        )
+
+    saved = _event_state.set_pending_action_presence_confirmation(
+        action_id,
+        True,
+        event_id=event_id,
+    )
+    if not saved:
+        return "ما قدرت أربط تأكيد وجودك بطلب الحضور بشكل آمن، لذلك ما نفذت أي شيء."
+
+    # Replying to this prompt proves the notification/event was seen, so stop
+    # Phase-4B reminders for the same event as well.
+    _event_state.acknowledge_event(event_id)
+
+    result = _retry_verified_pending_action(
+        event_id,
+        action_id,
+    ) or {}
+    status = str(result.get("status") or "unknown")
+    message = str(result.get("message") or "").strip()
+
+    if status == "success":
+        return (
+            f"تمام، ثبتت وجودك الفعلي في {course} لهذا الحدث فقط، "
+            "ونفذت الطلب وتأكدت من النتيجة من الحالة الخارجية الجديدة ✅"
+        )
+
+    if status == "failed":
+        suffix = f" السبب: {message}" if message else ""
+        return (
+            f"ثبتت وجودك الفعلي في {course} لهذا الحدث، لكن محاولة التنفيذ فشلت."
+            f"{suffix}"
+        )
+
+    if status == "blocked":
+        if "not registered" in message.lower():
+            return (
+                f"تمام، ثبتت وجودك الفعلي في {course} لهذا الحدث فقط. "
+                "لكن تنفيذ تسجيل الحضور الحقيقي على Moodle لسا غير موصول، "
+                "فما سجلت حضورك وما رح أدّعي إنه تسجل."
+            )
+        suffix = f" السبب: {message}" if message else ""
+        return (
+            f"ثبتت وجودك في {course}، لكن بوابة الأمان منعت التنفيذ."
+            f"{suffix}"
+        )
+
+    suffix = f" التفاصيل: {message}" if message else ""
+    return (
+        f"ثبتت وجودك الفعلي في {course} لهذا الحدث، لكن نتيجة التنفيذ غير مؤكدة، "
+        "لذلك ما رح أعتبر الحضور مسجلًا."
+        f"{suffix}"
+    )
+
+
+def _handle_event_state_control(user_input):
+    """Fast Phase-4 control path for event state and presence confirmation."""
+    presence_response = _handle_presence_confirmation_control(user_input)
+    if presence_response is not None:
+        return presence_response
+
+    if _is_missed_events_question(user_input):
+        snapshot = _event_state.snapshot(max_events=50, max_actions=20)
+        return _format_unacknowledged_events(snapshot.get("unacknowledged_events") or [])
+
+    if _is_event_acknowledgement(user_input):
+        event = _event_state.acknowledge_latest_unacknowledged()
+        if not event:
+            return "تمام، بس ما عندي حاليًا حدث جديد غير مؤكد حتى أعلّمه كمقروء."
+        payload = event.get("payload") or {}
+        name = payload.get("name")
+        label = _event_readable_label(event.get("type"))
+        if name:
+            return f"تمام، سجلت إنك شفت آخر تنبيه: {label} — {name}."
+        return f"تمام، سجلت إنك شفت آخر تنبيه: {label}."
+
+    return None
+
+
+def _pending_action_policy(decision):
+    """Derive safety requirements from the structured requested action."""
+
+    requested_action = str(
+        decision.requested_action or "notify"
+    ).strip().lower().replace(" ", "_")
+
+    if requested_action == "notify":
+        return {
+            "authorization_required": False,
+            "authorized": False,
+            "authorization_source": None,
+            "presence_required": False,
+        }
+
+    # The explicit user command that creates the mutation watch is prospective
+    # authorization for that mutation. Physical presence is a separate,
+    # time-sensitive precondition and is never inferred in advance.
+    presence_required_actions = {
+        "register_attendance",
+        "mark_attendance",
+        "submit_attendance",
+    }
+
+    return {
+        "authorization_required": True,
+        "authorized": True,
+        "authorization_source": "explicit_user_request",
+        "presence_required": requested_action in presence_required_actions,
+    }
+
+
 def _register_watch_from_decision(user_input, decision):
     filters = dict(decision.event_filters or {})
     # Canonicalize course references when possible so future monitor events match
@@ -5012,18 +5534,37 @@ def _register_watch_from_decision(user_input, decision):
                 filters["course_ref"] = ref
         except Exception:
             filters.setdefault("course_ref", ref)
+    policy = _pending_action_policy(decision)
+
     pending = _event_state.add_pending_action(
         trigger_type=decision.trigger_type,
         filters=filters,
         requested_action=decision.requested_action or "notify",
         notify=decision.notify,
         original_request=user_input,
+        authorization_required=policy["authorization_required"],
+        authorized=policy["authorized"],
+        authorization_source=policy["authorization_source"],
+        presence_required=policy["presence_required"],
     )
     trigger = pending.get("trigger_type", "الحدث")
+    requested_action = pending.get("requested_action", "notify")
+
+    if requested_action == "notify":
+        action_text = "وأبلغك لما يصير"
+    elif pending.get("presence_required"):
+        action_text = "وإذا صار الحدث رح أطلب منك تأكيد وجودك وقتها قبل أي تنفيذ"
+    else:
+        action_text = "وأنفذ المطلوب فقط عبر بوابة التحقق الآمنة"
+
     if filters:
         readable_filters = ", ".join(f"{k}={v}" for k, v in filters.items())
-        return f"تمام، حفظت الطلب. رح أراقب {trigger} ({readable_filters}) وأنفذ المطلوب لما يصير."
-    return f"تمام، حفظت الطلب. رح أراقب {trigger} وأنفذ المطلوب لما يصير."
+        return (
+            f"تمام، حفظت الطلب. رح أراقب {trigger} "
+            f"({readable_filters}) {action_text}."
+        )
+
+    return f"تمام، حفظت الطلب. رح أراقب {trigger} {action_text}."
 
 
 def _should_consult_agent_core(user_input):
@@ -5131,6 +5672,14 @@ def process_user_message(user_input):
     user_input = user_input.strip()
     if not user_input:
         return "اكتبلي سؤالك."
+
+    # Phase 4 persistent notification/event state is deterministic control data.
+    # Resolve it before ordinary conversation so missed-event questions never
+    # wake Moodle or Ollama and explicit acknowledgements are persisted safely.
+    event_control = _handle_event_state_control(user_input)
+    if event_control is not None:
+        return event_control
+
     # Fast conversation control: never wake Moodle/Ollama for greetings,
     # identity/capability intros, or refinements of an existing result set.
     control_response = _conversation_control(user_input)
@@ -5149,16 +5698,19 @@ def process_user_message(user_input):
     if capability is not None:
         return capability
 
-    # V5 Agent Core: natural/open-ended turns are planned from grounded state
-    # before the legacy phrase-oriented follow-up machinery.
-    core_response = _run_agent_core(user_input)
-    if core_response is not None:
-        return core_response
-
-    # Grounded state wins over semantic/course inference for actual actions.
+    # Grounded conversational state wins before any LLM planning.  A correction
+    # such as "بدي الأول بس" after a resource/assignment/quiz list is already
+    # unambiguous and should be resolved instantly from the known result set.
+    # Open-ended turns still fall through to Agent Core below.
     state_response = _state_first_followup(user_input)
     if state_response is not None:
         return state_response
+
+    # V5 Agent Core handles the remaining natural/open-ended turns after grounded
+    # state had the first chance to resolve them safely and cheaply.
+    core_response = _run_agent_core(user_input)
+    if core_response is not None:
+        return core_response
 
     # Pending course clarification / active learning
     pending_answer = _handle_pending_course_answer(user_input)

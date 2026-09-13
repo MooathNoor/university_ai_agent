@@ -8,6 +8,7 @@ import tools
 
 from notification import send_notification
 from event_state import EventState
+from verified_actions import VerifiedActionRunner
 
 from tools import (
     get_my_courses,
@@ -44,6 +45,32 @@ CHECK_INTERVAL = 300
 # 86400 seconds = 24 hours
 DEDUP_WINDOW_SECONDS = 86400
 
+# Phase 4B reminder policy.  Only events whose original Telegram notification
+# was confirmed as sent are eligible.  Successful reminders are capped so the
+# agent never spams the student.
+REMINDER_POLICIES = {
+    "attendance_opened": {
+        "first_after_minutes": 10,
+        "repeat_after_minutes": 20,
+        "max_reminders": 2,
+    },
+    "quiz_added": {
+        "first_after_minutes": 30,
+        "repeat_after_minutes": 120,
+        "max_reminders": 2,
+    },
+    "assignment_added": {
+        "first_after_minutes": 60,
+        "repeat_after_minutes": 360,
+        "max_reminders": 2,
+    },
+    "deadline_near": {
+        "first_after_minutes": 15,
+        "repeat_after_minutes": 60,
+        "max_reminders": 2,
+    },
+}
+
 
 # ============================================================
 # COURSE CACHE
@@ -51,6 +78,7 @@ DEDUP_WINDOW_SECONDS = 86400
 
 _course_cache = None
 _event_state = EventState()
+_verified_action_runner = VerifiedActionRunner()
 
 
 def get_cached_courses():
@@ -257,6 +285,244 @@ def notification_channel_for_event(event_result):
         return "telegram"
 
     return NOTIFICATION_CHANNEL
+
+
+# ============================================================
+# PHASE 4C - VERIFIED STATE-CHANGING ACTIONS
+# ============================================================
+
+def register_verified_action(
+    action_type,
+    executor,
+    verifier,
+    *,
+    requires_authorization=True,
+    requires_presence=False
+):
+    """Register one real state-changing capability with execution + verification.
+
+    Registration is explicit.  An arbitrary ``requested_action`` stored in event
+    state can never execute code merely because its name appears in a pending
+    action.  If it is not registered here, VerifiedActionRunner fails closed.
+    """
+
+    _verified_action_runner.register(
+        action_type,
+        executor,
+        verifier,
+        requires_authorization=requires_authorization,
+        requires_presence=requires_presence,
+    )
+
+
+def _event_action_payload(event_result, pending_action):
+    """Build the grounded payload supplied to a verified action executor."""
+
+    event = (event_result or {}).get("event") or {}
+    event_payload = event.get("payload") or {}
+
+    payload = dict(event_payload) if isinstance(event_payload, dict) else {}
+    payload.update({
+        "event_id": event.get("id"),
+        "event_type": event.get("type"),
+        "pending_action_id": pending_action.get("id"),
+        "original_request": pending_action.get("original_request", ""),
+    })
+    return payload
+
+
+def process_matching_pending_actions(event_result):
+    """Execute matched non-notification actions only through Phase 4C's gate.
+
+    ``notify`` remains read-only and is handled by the existing Notification
+    Manager.  Every other requested action is passed to VerifiedActionRunner.
+
+    Security rules:
+    - unregistered action -> blocked
+    - missing stored authorization -> blocked
+    - presence-sensitive action without confirmed presence -> blocked
+    - execution alone never means success
+    - a pending action is completed only after fresh verification succeeds
+    """
+
+    matches = (event_result or {}).get("matching_actions") or []
+    results = []
+
+    for action in matches:
+        if not isinstance(action, dict):
+            continue
+
+        requested_action = str(
+            action.get("requested_action") or "notify"
+        ).strip().lower().replace(" ", "_")
+
+        if not requested_action or requested_action == "notify":
+            continue
+
+        payload = _event_action_payload(
+            event_result,
+            action
+        )
+
+        event = (event_result or {}).get("event") or {}
+        event_id = str(event.get("id") or "").strip()
+
+        presence_confirmed = (
+            action.get("presence_confirmed") is True
+            and str(action.get("presence_confirmed_event_id") or "").strip()
+            == event_id
+        )
+
+        result = _verified_action_runner.run(
+            requested_action,
+            payload,
+            authorized=(action.get("authorized") is True),
+            presence_confirmed=presence_confirmed,
+        )
+
+        result_dict = result.to_dict()
+        result_dict["pending_action_id"] = action.get("id")
+        result_dict["original_request"] = action.get("original_request", "")
+        result_dict["event_id"] = event_id
+        result_dict["authorized"] = action.get("authorized") is True
+        result_dict["presence_required"] = action.get("presence_required") is True
+        result_dict["presence_confirmed"] = presence_confirmed
+        results.append(result_dict)
+
+        print(
+            f"\n[VERIFIED ACTION] {requested_action}: "
+            f"{result.status} "
+            f"(execution={result.execution_status}, "
+            f"verification={result.verification_status})"
+        )
+
+        # A one-shot state-changing request is complete only when the external
+        # system independently proves that the requested state now exists.
+        if result.status == "success":
+            action_id = action.get("id")
+            if action_id:
+                completed = _event_state.complete_pending_action(
+                    action_id
+                )
+                if not completed:
+                    print(
+                        f"[VERIFIED ACTION] Warning: could not mark "
+                        f"pending action {action_id} completed."
+                    )
+
+    return results
+
+
+def retry_pending_action_for_event(event_id, pending_action_id):
+    """Retry exactly one previously-triggered pending action.
+
+    Used after a conversational precondition such as physical presence is
+    confirmed. The event/action relationship is reloaded from persistent state
+    and validated before entering the normal VerifiedActionRunner path.
+    """
+    event_id = str(event_id or "").strip()
+    pending_action_id = str(pending_action_id or "").strip()
+
+    if not event_id or not pending_action_id:
+        return {
+            "status": "blocked",
+            "message": "Missing event or pending-action identity.",
+        }
+
+    snapshot = _event_state.snapshot(
+        max_events=200,
+        max_actions=200,
+    )
+
+    event = next(
+        (
+            item for item in (snapshot.get("recent_events") or [])
+            if str(item.get("id") or "") == event_id
+        ),
+        None,
+    )
+    action = next(
+        (
+            item for item in (snapshot.get("pending_actions") or [])
+            if str(item.get("id") or "") == pending_action_id
+        ),
+        None,
+    )
+
+    if not event:
+        return {
+            "status": "blocked",
+            "message": "The original event is no longer available.",
+        }
+
+    if not action:
+        return {
+            "status": "blocked",
+            "message": "The pending action is no longer active.",
+        }
+
+    if str(action.get("last_triggered_event_id") or "") != event_id:
+        return {
+            "status": "blocked",
+            "message": "The pending action is not bound to this event.",
+        }
+
+    results = process_matching_pending_actions({
+        "event": event,
+        "matching_actions": [action],
+    })
+
+    if not results:
+        return {
+            "status": "blocked",
+            "message": "No state-changing action was available to retry.",
+        }
+
+    return results[0]
+
+
+def verified_action_note(results):
+    """Format concise verification outcomes for the event notification."""
+
+    if not results:
+        return ""
+
+    lines = ["", "🔐 Saved action result:"]
+
+    for result in results:
+        action_type = result.get("action_type") or "action"
+        status = result.get("status") or "unknown"
+        message = str(result.get("message") or "").strip()
+
+        if (
+            status == "blocked"
+            and result.get("presence_required") is True
+            and result.get("authorized") is True
+            and result.get("presence_confirmed") is not True
+        ):
+            lines.append(
+                "- 🟡 قبل أي تسجيل حضور لازم تأكدلي إنك موجود فعليًا بالمحاضرة الآن."
+            )
+            lines.append(
+                "  إذا أنت موجود، رد بشكل طبيعي مثل: أنا موجود بالمحاضرة."
+            )
+            continue
+
+        if status == "success":
+            prefix = "✅ verified"
+        elif status == "blocked":
+            prefix = "🛑 blocked"
+        elif status == "failed":
+            prefix = "❌ failed"
+        else:
+            prefix = "⚠️ unverified"
+
+        line = f"- {action_type}: {prefix}"
+        if message:
+            line += f" — {message}"
+        lines.append(line)
+
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -784,7 +1050,13 @@ def collect_attendance(courses):
 
         attendance_state[course_name] = {
             "course_id": course.get("id"),
-            "status": result.get("status"),
+            # ``status`` from tools.get_attendance means request success/error.
+            # Monitoring needs the actual student-facing activity state instead.
+            # Keep the legacy fallback only for older fixtures/tests.
+            "status": result.get("activity_state") or result.get("status"),
+            "request_status": result.get("status"),
+            "attendance_url": result.get("attendance_url"),
+            "discovery": result.get("discovery", {}),
             "percentage": result.get(
                 "percentage"
             ),
@@ -1285,7 +1557,8 @@ def log_action(action_type, message):
 def execute_action(
     action_type,
     message,
-    channel=None
+    channel=None,
+    event_result=None
 ):
     """
     Execute one action.
@@ -1300,6 +1573,13 @@ def execute_action(
 
     This prevents duplicate notifications.
     """
+
+    resolved_channel = channel or NOTIFICATION_CHANNEL
+    event_id = None
+    if isinstance(event_result, dict):
+        event = event_result.get("event") or {}
+        if isinstance(event, dict):
+            event_id = event.get("id")
 
     print("\n" + "-" * 70)
     print("ACTION HANDLER")
@@ -1327,6 +1607,13 @@ def execute_action(
             "is a duplicate."
         )
 
+        if event_id:
+            _event_state.mark_event_notification(
+                event_id,
+                "skipped_duplicate",
+                channel=resolved_channel,
+                notification_type=action_type,
+            )
         return False
 
     # --------------------------------------------------------
@@ -1345,6 +1632,13 @@ def execute_action(
             "the action log could not be written."
         )
 
+        if event_id:
+            _event_state.mark_event_notification(
+                event_id,
+                "failed",
+                channel=resolved_channel,
+                notification_type=action_type,
+            )
         return False
 
     # --------------------------------------------------------
@@ -1354,7 +1648,7 @@ def execute_action(
     notification_sent = send_notification(
         action_type,
         message,
-        channel=(channel or NOTIFICATION_CHANNEL)
+        channel=resolved_channel
     )
 
     if notification_sent:
@@ -1374,11 +1668,27 @@ def execute_action(
                 "be saved."
             )
 
+        if event_id:
+            _event_state.mark_event_notification(
+                event_id,
+                "sent",
+                channel=resolved_channel,
+                notification_type=action_type,
+            )
+
         print(
             "\nNotification sent successfully."
         )
 
         return True
+
+    if event_id:
+        _event_state.mark_event_notification(
+            event_id,
+            "failed",
+            channel=resolved_channel,
+            notification_type=action_type,
+        )
 
     print(
         "\nNotification could not be sent."
@@ -1415,6 +1725,9 @@ def handle_new_assignment(assignment):
         "assignment_added",
         payload
     )
+    verified_results = process_matching_pending_actions(
+        event_result
+    )
 
     message = (
         f"New assignment '{assignment.get('name')}' "
@@ -1422,6 +1735,7 @@ def handle_new_assignment(assignment):
         f"Due: {assignment.get('due')}. "
         f"URL: {assignment.get('url')}"
         f"{pending_action_note(event_result)}"
+        f"{verified_action_note(verified_results)}"
     )
 
     return execute_action(
@@ -1429,7 +1743,8 @@ def handle_new_assignment(assignment):
         message,
         channel=notification_channel_for_event(
             event_result
-        )
+        ),
+        event_result=event_result
     )
 
 
@@ -1484,7 +1799,8 @@ def handle_changed_assignment(change):
         if execute_action(
             "ASSIGNMENT_CHANGED",
             message,
-            channel=channel
+            channel=channel,
+            event_result=event_result
         ):
 
             action_count += 1
@@ -1516,6 +1832,9 @@ def handle_new_quiz(quiz):
         "quiz_added",
         payload
     )
+    verified_results = process_matching_pending_actions(
+        event_result
+    )
 
     message = (
         f"New quiz '{quiz.get('name')}' "
@@ -1524,6 +1843,7 @@ def handle_new_quiz(quiz):
         f"Closed: {quiz.get('closed')}. "
         f"URL: {quiz.get('url')}"
         f"{pending_action_note(event_result)}"
+        f"{verified_action_note(verified_results)}"
     )
 
     return execute_action(
@@ -1531,7 +1851,8 @@ def handle_new_quiz(quiz):
         message,
         channel=notification_channel_for_event(
             event_result
-        )
+        ),
+        event_result=event_result
     )
 
 
@@ -1585,7 +1906,8 @@ def handle_changed_quiz(change):
         if execute_action(
             "QUIZ_CHANGED",
             message,
-            channel=channel
+            channel=channel,
+            event_result=event_result
         ):
 
             action_count += 1
@@ -1645,6 +1967,9 @@ def handle_attendance_changes(changes):
         event_type,
         payload
     )
+    verified_results = process_matching_pending_actions(
+        event_result
+    )
 
     message_lines = [
         f"Attendance update in '{course}'.",
@@ -1703,6 +2028,12 @@ def handle_attendance_changes(changes):
     if note:
         message_lines.append(note)
 
+    verification_note = verified_action_note(
+        verified_results
+    )
+    if verification_note:
+        message_lines.append(verification_note)
+
     message = "\n".join(
         message_lines
     )
@@ -1718,7 +2049,8 @@ def handle_attendance_changes(changes):
         message,
         channel=notification_channel_for_event(
             event_result
-        )
+        ),
+        event_result=event_result
     )
 
 
@@ -2091,6 +2423,88 @@ def print_events(events):
 
 
 # ============================================================
+# PHASE 4B - REMINDER POLICY
+# ============================================================
+
+def _reminder_event_label(event_type):
+    labels = {
+        "assignment_added": "الواجب الجديد",
+        "quiz_added": "الكويز الجديد",
+        "attendance_opened": "فتح الحضور",
+        "attendance_changed": "تحديث الحضور",
+        "deadline_near": "موعد التسليم القريب",
+    }
+    return labels.get(str(event_type or ""), "التحديث الجامعي")
+
+
+def build_event_reminder_message(event):
+    """Build a short grounded reminder from the existing event payload."""
+    payload = event.get("payload") or {}
+    label = _reminder_event_label(event.get("type"))
+    name = payload.get("name")
+    course = payload.get("course_name") or payload.get("course")
+
+    pieces = [f"تذكير: لسه ما أكدتلي إنك شفت {label}"]
+    if name:
+        pieces.append(str(name))
+    if course:
+        pieces.append(f"— {course}")
+    pieces.append("إذا شفته، ابعثلي: شفت الإشعار.")
+    return " ".join(pieces)
+
+
+def process_due_event_reminders(now=None):
+    """Send due reminders for important sent-but-unacknowledged events.
+
+    This intentionally does not create a new AgentEvent.  A reminder belongs to
+    the original event and its delivery history is persisted on that event.
+    """
+    due_events = _event_state.due_reminder_events(
+        REMINDER_POLICIES,
+        now=now,
+    )
+
+    if not due_events:
+        return 0
+
+    sent_count = 0
+    for event in due_events:
+        event_id = event.get("id")
+        if not event_id:
+            continue
+
+        channel = event.get("notification_channel") or NOTIFICATION_CHANNEL
+        message = build_event_reminder_message(event)
+
+        print("\n" + "-" * 70)
+        print("PHASE 4B REMINDER")
+        print("-" * 70)
+        print(f"Event ID: {event_id}")
+        print(f"Event type: {event.get('type')}")
+        print(f"Reminder count: {event.get('reminder_count', 0)}")
+
+        try:
+            success = bool(send_notification(
+                "REMINDER",
+                message,
+                channel=channel,
+            ))
+        except Exception as error:
+            print(f"Reminder send error: {error}")
+            success = False
+
+        _event_state.mark_event_reminder(
+            event_id,
+            "sent" if success else "failed",
+            channel=channel,
+        )
+        if success:
+            sent_count += 1
+
+    return sent_count
+
+
+# ============================================================
 # RUN ONE MONITORING CHECK
 # ============================================================
 
@@ -2142,9 +2556,13 @@ def run_monitoring_check():
         )
 
         print(
-            "\nNo events will be reported "
+            "\nNo new Moodle diff events will be reported "
             "during the first run."
         )
+
+        # Existing EventState reminders are independent from the Moodle
+        # snapshot baseline, so a monitor restart must not lose them.
+        process_due_event_reminders()
 
         return True
 
@@ -2172,6 +2590,12 @@ def run_monitoring_check():
     handle_events(
         events
     )
+
+    # --------------------------------------------------------
+    # Reminder policy for previously sent but unseen events
+    # --------------------------------------------------------
+
+    process_due_event_reminders()
 
     # --------------------------------------------------------
     # Save new state

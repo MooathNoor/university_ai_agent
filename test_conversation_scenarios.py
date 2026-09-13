@@ -182,26 +182,18 @@ def run():
     )
     check(len(event_result["matching_actions"]) == 1, f"real event did not match pending action: {event_result}")
 
-    # Scenario 10: event history is part of Agent Core state, so an unseen
-    # natural question about what happened while away can be answered from state.
+    # Scenario 10: missed-event history is deterministic Phase-4 control state.
+    # It must be answered directly from EventState without waking the LLM.
     history_calls = []
 
     def history_plan(message, state, **kwargs):
         history_calls.append((message, state))
-        events = (state.get("event_state") or {}).get("recent_events") or []
-        check(any(e.get("type") == "assignment_added" for e in events), "planner did not receive event history")
-        return SimpleNamespace(
-            action="respond", tool=None, course_ref=None, refresh=False,
-            response_goal="summarize missed events", clarification="", confidence=0.97,
-            reason="event history is grounded", answer="صار حدث جديد: نزل واجب بالحوسبة السحابية.",
-            trigger_type=None, event_filters={}, requested_action="notify", notify=True,
-            to_dict=lambda: {"action": "respond", "confidence": 0.97},
-        )
+        raise AssertionError("missed-event question should not wake Agent Core")
 
     agent._agent_core.plan = history_plan
     response = agent.process_user_message("شو صار وأنا غايب عن التلفون؟")
     check("نزل واجب" in response, f"event-history follow-up failed: {response}")
-    check(len(history_calls) == 1, "event-history question did not use Agent Core exactly once")
+    check(len(history_calls) == 0, "event-history question unnecessarily used Agent Core")
     agent._agent_core.plan = original_plan
 
     print("PASS: 10 end-to-end conversation scenarios")

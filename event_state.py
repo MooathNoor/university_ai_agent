@@ -43,6 +43,16 @@ class AgentEvent:
     payload: Dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=_utc_now)
     acknowledged: bool = False
+    acknowledged_at: Optional[str] = None
+    notification_status: str = "not_sent"
+    notification_channel: Optional[str] = None
+    notification_type: Optional[str] = None
+    notification_sent_at: Optional[str] = None
+    reminder_count: int = 0
+    reminder_last_status: Optional[str] = None
+    reminder_last_attempt_at: Optional[str] = None
+    reminder_last_sent_at: Optional[str] = None
+    reminder_channel: Optional[str] = None
 
 
 @dataclass
@@ -56,6 +66,18 @@ class PendingAction:
     created_at: str = field(default_factory=_utc_now)
     last_triggered_event_id: Optional[str] = None
     original_request: str = ""
+
+    # Phase 4C persistent authorization state.
+    authorization_required: bool = False
+    authorized: bool = False
+    authorized_at: Optional[str] = None
+    authorization_source: Optional[str] = None
+
+    # Presence-sensitive actions require a fresh, event-bound confirmation.
+    presence_required: bool = False
+    presence_confirmed: bool = False
+    presence_confirmed_at: Optional[str] = None
+    presence_confirmed_event_id: Optional[str] = None
 
 
 class EventState:
@@ -113,14 +135,44 @@ class EventState:
             if not isinstance(data, dict):
                 return
 
-            self.events = [
-                x for x in data.get("events", [])
-                if isinstance(x, dict)
-            ]
-            self.pending_actions = [
-                x for x in data.get("pending_actions", [])
-                if isinstance(x, dict)
-            ]
+            self.events = []
+            for raw in data.get("events", []):
+                if not isinstance(raw, dict):
+                    continue
+                item = dict(raw)
+                item.setdefault("acknowledged", False)
+                item.setdefault("acknowledged_at", None)
+                # Phase-2/3 files predate delivery tracking.  Their real
+                # delivery state cannot be reconstructed honestly.
+                item.setdefault("notification_status", "unknown")
+                item.setdefault("notification_channel", None)
+                item.setdefault("notification_type", None)
+                item.setdefault("notification_sent_at", None)
+                item.setdefault("reminder_count", 0)
+                item.setdefault("reminder_last_status", None)
+                item.setdefault("reminder_last_attempt_at", None)
+                item.setdefault("reminder_last_sent_at", None)
+                item.setdefault("reminder_channel", None)
+                self.events.append(item)
+            self.pending_actions = []
+            for raw in data.get("pending_actions", []):
+                if not isinstance(raw, dict):
+                    continue
+
+                item = dict(raw)
+
+                # Older state files predate persistent action authorization.
+                # Missing values deliberately fail closed.
+                item.setdefault("authorization_required", False)
+                item.setdefault("authorized", False)
+                item.setdefault("authorized_at", None)
+                item.setdefault("authorization_source", None)
+                item.setdefault("presence_required", False)
+                item.setdefault("presence_confirmed", False)
+                item.setdefault("presence_confirmed_at", None)
+                item.setdefault("presence_confirmed_event_id", None)
+
+                self.pending_actions.append(item)
             self._last_loaded_mtime_ns = mtime_ns
         except (json.JSONDecodeError, OSError):
             # A transient read failure must not stop the agent. The current
@@ -192,7 +244,7 @@ class EventState:
             f"{self.path}.{os.getpid()}.{threading.get_ident()}.tmp"
         )
         data = {
-            "version": 2,
+            "version": 5,
             "events": self.events[-200:],
             "pending_actions": self.pending_actions[-200:],
         }
@@ -240,6 +292,11 @@ class EventState:
         requested_action: str = "notify",
         notify: bool = True,
         original_request: str = "",
+        *,
+        authorization_required: bool = False,
+        authorized: bool = False,
+        authorization_source: Optional[str] = None,
+        presence_required: bool = False,
     ) -> Dict[str, Any]:
         trigger_type = _norm(trigger_type).replace(" ", "_")
         if not trigger_type:
@@ -251,15 +308,37 @@ class EventState:
             if v not in (None, "", [], {})
         }
 
+        normalized_action = (
+            _norm(requested_action).replace(" ", "_") or "notify"
+        )
+
+        authorization_required = bool(authorization_required)
+        authorized = bool(authorized)
+
+        if normalized_action == "notify":
+            authorization_required = False
+            authorized = False
+            authorization_source = None
+            presence_required = False
+
         pending = PendingAction(
             id=f"pa_{uuid.uuid4().hex[:12]}",
             trigger_type=trigger_type,
             filters=clean_filters,
-            requested_action=(
-                _norm(requested_action).replace(" ", "_") or "notify"
-            ),
+            requested_action=normalized_action,
             notify=bool(notify),
             original_request=str(original_request or "").strip(),
+            authorization_required=authorization_required,
+            authorized=authorized,
+            authorized_at=(
+                _utc_now()
+                if authorization_required and authorized
+                else None
+            ),
+            authorization_source=(
+                str(authorization_source or "").strip() or None
+            ),
+            presence_required=bool(presence_required),
         )
         item = asdict(pending)
 
@@ -364,8 +443,247 @@ class EventState:
             for event in self.events:
                 if event.get("id") == event_id:
                     event["acknowledged"] = True
+                    event["acknowledged_at"] = _utc_now()
                     return True
             return False
+
+        return self._mutate(operation)
+
+    def acknowledge_latest_unacknowledged(self) -> Optional[Dict[str, Any]]:
+        """Acknowledge the newest event the user has not confirmed seeing."""
+        def operation():
+            for event in reversed(self.events):
+                if not event.get("acknowledged"):
+                    event["acknowledged"] = True
+                    event["acknowledged_at"] = _utc_now()
+                    return dict(event)
+            return None
+
+        return self._mutate(operation)
+
+    def mark_event_notification(
+        self,
+        event_id: str,
+        status: str,
+        channel: Optional[str] = None,
+        notification_type: Optional[str] = None,
+    ) -> bool:
+        """Persist delivery state for one event.
+
+        Delivery and acknowledgement are intentionally separate. Telegram can
+        confirm that a message was sent, but it cannot prove the user read it.
+        Once an event is recorded as sent, a later retry/failure must not
+        downgrade that successful delivery.
+        """
+        clean_status = _norm(status).replace(" ", "_") or "unknown"
+
+        def operation():
+            for event in self.events:
+                if event.get("id") != event_id:
+                    continue
+                already_sent = event.get("notification_status") == "sent"
+                if already_sent and clean_status != "sent":
+                    return True
+                event["notification_status"] = clean_status
+                if channel:
+                    event["notification_channel"] = str(channel)
+                if notification_type:
+                    event["notification_type"] = str(notification_type)
+                if clean_status == "sent":
+                    event["notification_sent_at"] = _utc_now()
+                return True
+            return False
+
+        return self._mutate(operation)
+
+    def mark_event_reminder(
+        self,
+        event_id: str,
+        status: str,
+        channel: Optional[str] = None,
+    ) -> bool:
+        """Persist one reminder attempt for an existing event.
+
+        Reminder delivery is tracked independently from the original
+        notification.  Failed attempts do not consume the reminder quota; only
+        successfully sent reminders increment ``reminder_count``.
+        """
+        clean_status = _norm(status).replace(" ", "_") or "unknown"
+
+        def operation():
+            for event in self.events:
+                if event.get("id") != event_id:
+                    continue
+                now = _utc_now()
+                event["reminder_last_status"] = clean_status
+                event["reminder_last_attempt_at"] = now
+                if channel:
+                    event["reminder_channel"] = str(channel)
+                if clean_status == "sent":
+                    event["reminder_count"] = int(event.get("reminder_count") or 0) + 1
+                    event["reminder_last_sent_at"] = now
+                return True
+            return False
+
+        return self._mutate(operation)
+
+    @staticmethod
+    def _parse_timestamp(value: Any) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            return None
+
+    def due_reminder_events(
+        self,
+        policies: Dict[str, Dict[str, Any]],
+        now: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return important delivered events whose reminder window is due.
+
+        Eligibility is deliberately strict:
+        - the original notification must have been confirmed as sent;
+        - the user must not have acknowledged the event;
+        - the event type must have an explicit reminder policy;
+        - the successful reminder quota must not be exhausted.
+        """
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        current = current.astimezone(timezone.utc)
+
+        with self._lock:
+            self._load()
+            due = []
+            for event in self.events:
+                if event.get("acknowledged"):
+                    continue
+                if event.get("notification_status") != "sent":
+                    continue
+
+                event_type = str(event.get("type") or "")
+                policy = policies.get(event_type)
+                if not isinstance(policy, dict):
+                    continue
+
+                reminder_count = int(event.get("reminder_count") or 0)
+                max_reminders = max(0, int(policy.get("max_reminders", 0) or 0))
+                if reminder_count >= max_reminders:
+                    continue
+
+                if reminder_count == 0:
+                    anchor = self._parse_timestamp(event.get("notification_sent_at"))
+                    wait_minutes = float(policy.get("first_after_minutes", 0) or 0)
+                else:
+                    anchor = self._parse_timestamp(event.get("reminder_last_sent_at"))
+                    wait_minutes = float(policy.get("repeat_after_minutes", 0) or 0)
+
+                if anchor is None:
+                    continue
+                elapsed_seconds = (current - anchor).total_seconds()
+                if elapsed_seconds < max(0.0, wait_minutes * 60.0):
+                    continue
+
+                item = dict(event)
+                item["reminder_policy"] = dict(policy)
+                due.append(item)
+
+            return due
+
+    def set_pending_action_authorization(
+        self,
+        action_id: str,
+        authorized: bool,
+        *,
+        source: Optional[str] = None,
+    ) -> bool:
+        """Persist or revoke authorization for one pending mutation."""
+
+        def operation():
+            for action in self.pending_actions:
+                if action.get("id") != action_id:
+                    continue
+
+                value = bool(authorized)
+                action["authorized"] = value
+                action["authorized_at"] = _utc_now() if value else None
+                action["authorization_source"] = (
+                    (str(source or "").strip() or None)
+                    if value
+                    else None
+                )
+                return True
+
+            return False
+
+        return self._mutate(operation)
+
+    def set_pending_action_presence_confirmation(
+        self,
+        action_id: str,
+        confirmed: bool,
+        *,
+        event_id: Optional[str] = None,
+    ) -> bool:
+        """Persist presence confirmation for exactly one observed event."""
+
+        if confirmed and not str(event_id or "").strip():
+            return False
+
+        def operation():
+            for action in self.pending_actions:
+                if action.get("id") != action_id:
+                    continue
+
+                value = bool(confirmed)
+                action["presence_confirmed"] = value
+                action["presence_confirmed_at"] = (
+                    _utc_now() if value else None
+                )
+                action["presence_confirmed_event_id"] = (
+                    str(event_id).strip()
+                    if value
+                    else None
+                )
+                return True
+
+            return False
+
+        return self._mutate(operation)
+
+    def clear_stale_presence_confirmations(
+        self,
+        current_event_id: Optional[str],
+    ) -> int:
+        """Clear confirmations that belong to another event."""
+
+        current_event_id = str(current_event_id or "").strip()
+        cleared = 0
+
+        def operation():
+            nonlocal cleared
+
+            for action in self.pending_actions:
+                confirmed_event_id = str(
+                    action.get("presence_confirmed_event_id") or ""
+                ).strip()
+
+                if (
+                    action.get("presence_confirmed") is True
+                    and confirmed_event_id
+                    and confirmed_event_id != current_event_id
+                ):
+                    action["presence_confirmed"] = False
+                    action["presence_confirmed_at"] = None
+                    action["presence_confirmed_event_id"] = None
+                    cleared += 1
+
+            return cleared
 
         return self._mutate(operation)
 
