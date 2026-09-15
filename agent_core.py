@@ -179,6 +179,7 @@ Never choose an immediate Moodle tool for this turn.
 Rules:
 - Use watch when the future trigger and requested reaction are understandable.
 - Use clarify only if a necessary trigger/reference cannot be resolved safely.
+- Any clarification must be written in the same language/dialect as the student message.
 - Never invent an event that already happened.
 - course_ref should be the course phrase explicitly/reliably referenced, or null.
 - requested_action must preserve what the student actually wants to happen.
@@ -235,6 +236,7 @@ GROUNDING AND PLANNING RULES:
 7. If a proven deterministic executor is better for an already-clear structured
    command, action=legacy is acceptable.
 8. Ask for clarification only when a necessary reference truly cannot be resolved.
+   Write clarification and answer in the same language/dialect as the student message.
 9. Everyday wording is not an intent.  Understand meaning, not keywords.
 10. A response action may give normal advice, but factual claims must be limited
     to grounded STATE.

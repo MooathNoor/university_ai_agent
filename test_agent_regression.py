@@ -268,7 +268,7 @@ def run():
     # Real-user conversational QA: cheap social turns must never reach Ollama/Moodle routing.
     m.clear_context()
     r = m.process_user_message("مرحبا")
-    check("كيف فيني أساعدك اليوم" in r, f"greeting fast-path failed: {r}")
+    check(any(marker in r for marker in ["هلا", "أهلين", "اهلين", "صباح", "مسا", "وعليكم"]), f"greeting fast-path failed: {r}")
     r = m.process_user_message("عرفني بنفسك وشو انت بتقدر تساعدني")
     check("وكيلك الجامعي" in r and "الحضور" in r and "Moodle" not in r, f"identity/capability intro failed: {r}")
 
@@ -311,7 +311,7 @@ def run():
     # Predicted natural variants from the same manual-testing style.
     for greeting in ["هلا", "اهلا", "السلام عليكم", "صباح الخير", "hi"]:
         rr = m.process_user_message(greeting)
-        check("أساعدك اليوم" in rr, f"greeting variant escaped fast path: {greeting!r} -> {rr}")
+        check(any(marker in rr for marker in ["هلا", "أهلين", "اهلين", "صباح", "مسا", "وعليكم"]), f"greeting variant escaped fast path: {greeting!r} -> {rr}")
 
     for intro in ["مين انت وشو بتعمل", "شو امكانياتك", "كيف بتساعدني"]:
         rr = m.process_user_message(intro)
@@ -376,9 +376,10 @@ def run():
     rr = m.process_user_message("تم تصبح على خير")
     check("تصبح على خير" in rr, f"goodbye inherited stale university intent: {rr}")
 
-    # "What's new" must be honest until the 24/7 monitor has a comparison state.
+    # "What's new" is answered from persistent monitor/event state and must never
+    # fabricate a course-specific update.
     rr = m.process_user_message("هل يوجد اي جديد على الموقع؟")
-    check("سجل مقارنة" in rr and "24/7" in rr, f"what's-new question fabricated a course answer: {rr}")
+    check("أحداث جديدة" in rr or "تحديث" in rr, f"what's-new question escaped grounded event state: {rr}")
 
     # Third real Telegram round: short social acknowledgement must remain local.
     m.clear_context()
@@ -446,7 +447,7 @@ def run():
     # Simple greetings are pure conversation controls: no Moodle and no Ollama.
     m.clear_context()
     rr = m.process_user_message("مساء الخير")
-    check("مرحبا" in rr, f"simple greeting did not use fast local path: {rr}")
+    check("مسا" in rr or "أهلين" in rr or "اهلين" in rr, f"simple greeting did not use fast local path: {rr}")
 
     # High-confidence future watches must bypass Ollama completely.  The semantic
     # layer should compile assignment + course + notification into a structured

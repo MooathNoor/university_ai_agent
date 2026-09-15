@@ -83,6 +83,7 @@ _conversation_state = {
     "active_course": None,       # {id, name, source}
     "active_entity": None,       # {type, item, course_id}
     "last_result_set": None,     # {type, course_id, course_name, items}
+    "last_multi_result_sets": {},# grounded result sets keyed by domain
     "last_intent": None,
     "teach_waiting": False,      # next turn is expected to contain a teach rule
 }
@@ -452,7 +453,9 @@ def clear_context():
         "active_course": None,
         "active_entity": None,
         "last_result_set": None,
+        "last_multi_result_sets": {},
         "last_intent": None,
+        "recent_entities": [],
         "teach_waiting": False,
     }
 
@@ -531,6 +534,7 @@ def _sync_conversation_state(
         if changed:
             _conversation_state["active_entity"] = None
             _conversation_state["last_result_set"] = None
+            _conversation_state["last_multi_result_sets"] = {}
 
         _conversation_state["active_course"] = {
             "id": new_id if new_id is not None else old.get("id"),
@@ -553,6 +557,7 @@ def _sync_conversation_state(
                 "item": dict(selected_item),
                 "course_id": selected_item.get("course_id") or (None if course_id is _UNSET else course_id),
             }
+            _remember_recent_entity(kind, selected_item)
 
     if isinstance(selected_items, list):
         effective_intent = None if intent is _UNSET else intent
@@ -577,6 +582,69 @@ def _sync_conversation_state(
                 "course_name": inferred_course_name,
                 "items": clean_items,
             }
+
+
+def _remember_recent_entity(kind, item):
+    """Keep a small grounded entity history for pronoun/reference resolution.
+
+    This history survives course switches.  It stores only objects that were
+    actually returned/selected from tools, never free-form user phrases.
+    """
+    if kind not in {"quiz", "assignment", "course_resource"} or not isinstance(item, dict):
+        return
+    history = _conversation_state.setdefault("recent_entities", [])
+    course_id = item.get("course_id")
+    key = (kind, str(course_id or ""), str(item.get("url") or item.get("name") or ""))
+    history[:] = [
+        entry for entry in history
+        if (entry.get("type"), str(entry.get("course_id") or ""), str((entry.get("item") or {}).get("url") or (entry.get("item") or {}).get("name") or "")) != key
+    ]
+    history.append({
+        "type": kind,
+        "course_id": course_id,
+        "course_name": item.get("course_name") or item.get("course"),
+        "item": dict(item),
+        "timestamp": time.time(),
+    })
+    del history[:-10]
+
+
+def _recent_entity(kind=None, course_id=None):
+    history = _conversation_state.get("recent_entities") or []
+    for entry in reversed(history):
+        if not isinstance(entry, dict):
+            continue
+        if kind and entry.get("type") != kind:
+            continue
+        if course_id is not None and str(entry.get("course_id")) != str(course_id):
+            continue
+        item = entry.get("item")
+        if isinstance(item, dict):
+            return dict(item)
+    return None
+
+
+def _recent_distinct_entities(kind, limit=2, max_age_seconds=600):
+    """Return recent grounded entities, newest per course, in conversation order."""
+    now = time.time()
+    chosen = []
+    seen_courses = set()
+    for entry in reversed(_conversation_state.get("recent_entities") or []):
+        if not isinstance(entry, dict) or entry.get("type") != kind:
+            continue
+        ts = float(entry.get("timestamp") or 0)
+        if ts and now - ts > max_age_seconds:
+            continue
+        course_key = str(entry.get("course_id") or entry.get("course_name") or "")
+        if course_key in seen_courses:
+            continue
+        item = entry.get("item")
+        if isinstance(item, dict):
+            chosen.append(dict(item))
+            seen_courses.add(course_key)
+        if len(chosen) >= limit:
+            break
+    return list(reversed(chosen))
 
 
 def _active_entity_item(entity_type=None):
@@ -1116,6 +1184,11 @@ def deterministic_course_matches(user_input, courses):
         mentions = profile.get("example_mentions", []) if isinstance(profile, dict) else []
         candidates = [canonical, _clean_moodle_course_title(canonical)]
         for alias in list(aliases) + list(mentions):
+            # Auto/learned aliases must remain course-like.  This also makes old
+            # accidental aliases (for example a complaint phrase) inert without
+            # mutating the user's semantic-index file behind their back.
+            if not _safe_auto_course_alias(alias):
+                continue
             if alias not in candidates:
                 candidates.append(alias)
         best_score = 0.0
@@ -1205,9 +1278,12 @@ def _handle_pending_course_answer(user_input):
     if time.time() - float(pending.get("timestamp", 0)) > 600:
         _clear_pending_course_resolution()
         return None
-    # A fresh university request is not treated as a clarification answer.
+    # A fresh university request starts a new task and invalidates the old
+    # clarification.  Otherwise an unrelated later "1" can accidentally answer
+    # a stale prompt from several turns ago.
     quick = _fast_semantic_analysis(user_input)
     if quick.get("intents"):
+        _clear_pending_course_resolution()
         return None
     courses = load_courses()
     if not courses or pending.get("fingerprint") != _course_fingerprint(courses):
@@ -1224,8 +1300,10 @@ def _handle_pending_course_answer(user_input):
     original = pending.get("original_message", "")
     reference = pending.get("reference", "")
     _clear_pending_course_resolution()
-    if reference:
+    if reference and _safe_auto_course_alias(reference):
         # Never teach a whole multi-course phrase as an alias for one course.
+        # A numeric clarification confirms the COURSE, not arbitrary preceding
+        # conversational text. Only a course-like phrase is eligible to persist.
         multi = _deterministic_multi_course_matches(reference, courses)
         if not multi:
             _learn_course_alias(chosen, reference, courses)
@@ -1783,8 +1861,18 @@ def _arbitrate_intents(user_input, intents):
     text = normalize_text(user_input)
     unique = list(dict.fromkeys(intents))
 
+    # ``pending_work`` is a narrow cross-course question about unfinished
+    # assignments/quizzes.  Do not let it swallow an explicit multi-domain
+    # status request such as "any new quizzes, assignments, files or attendance?".
+    # In that case each explicitly requested capability must survive routing.
     if _is_pending_work_request(text):
-        return ["pending_work"]
+        explicit_other_domains = any(
+            intent in unique
+            for intent in {"course_files", "attendance", "announcements", "deadlines"}
+        )
+        if not explicit_other_domains:
+            return ["pending_work"]
+        unique = [intent for intent in unique if intent != "pending_work"]
 
     # A grades request about quizzes is one task, not two independent intents.
     if "quiz_grades" in unique:
@@ -2320,7 +2408,21 @@ def apply_temporal_filter(
             copy["_parsed_date"] = parsed
             dated_items.append(copy)
     if not dated_items:
-        return items
+        # Moodle items do not always expose a parseable date. Ordinal/first/last
+        # selection still has a well-defined meaning in the displayed Moodle order.
+        plain_items = [dict(item) for item in items if isinstance(item, dict)]
+        if is_earliest_request(text):
+            return plain_items[:1]
+        if is_latest_request(text):
+            return plain_items[-1:]
+        ordinal_index = extract_ordinal_index(text)
+        if ordinal_index and ordinal_index > 0:
+            position = ordinal_index - 1
+            return plain_items[position:position + 1] if position < len(plain_items) else []
+        count = extract_requested_count(text)
+        if count and count > 1:
+            return plain_items[:count]
+        return plain_items
     dated_items.sort(
         key=lambda item: item["_parsed_date"]
     )
@@ -2675,8 +2777,8 @@ def handle_selected_grade(user_input=""):
             user_input=user_input,
         )
         grade_text = str(enriched.get("grade_text", "")).strip()
-        grade = str(enriched.get("grade", "")).strip()
-        max_grade = str(enriched.get("max_grade", "")).strip()
+        grade = "" if enriched.get("grade") is None else str(enriched.get("grade", "")).strip()
+        max_grade = "" if enriched.get("max_grade") is None else str(enriched.get("max_grade", "")).strip()
         if grade_text:
             return f"علامتك في {enriched.get('name', 'الكويز')}: {grade_text}"
         if grade:
@@ -2713,8 +2815,8 @@ def format_quiz_grades(items):
     for index, quiz in enumerate(items, start=1):
         name = quiz.get("name", f"كويز {index}")
         grade_text = str(quiz.get("grade_text", "")).strip()
-        grade = str(quiz.get("grade", "")).strip()
-        max_grade = str(quiz.get("max_grade", "")).strip()
+        grade = "" if quiz.get("grade") is None else str(quiz.get("grade", "")).strip()
+        max_grade = "" if quiz.get("max_grade") is None else str(quiz.get("max_grade", "")).strip()
         state = quiz.get("grade_state", "unknown")
         if grade_text:
             shown = grade_text
@@ -2952,6 +3054,24 @@ def _assignment_description_is_sufficient(description):
     )
     if location_reference or arabic_location_reference:
         return False
+
+    # A bare pointer such as "solve example 2 Jacobi method" still names where
+    # the real exercise lives; it does not provide the equations/data needed to
+    # solve it.  The older guard required a second location word (unit/chapter),
+    # which allowed this exact Phase-5 failure to reach the LLM and hallucinate.
+    bare_numbered_reference = bool(
+        re.search(r"\b(?:example|exercise|question|problem)\s*#?\s*\d+\b", text)
+        or re.search(r"(?:مثال|تمرين|سؤال|مساله|مسألة)\s*\d+", text)
+    )
+    if bare_numbered_reference:
+        # If Moodle actually contains mathematical data/equations, keep it.
+        # Otherwise treat the text as a reference only and request the source.
+        math_evidence = bool(
+            re.search(r"(?:=|\[|\]|\{|\}|\b\d+(?:\.\d+)?\s*[+*/^]\s*[-+]?\d+)", text)
+            or len(re.findall(r"[-+]?\d+(?:\.\d+)?", text)) >= 4
+        )
+        if not math_evidence:
+            return False
     return True
 
 
@@ -3645,7 +3765,10 @@ def run_single_intent(
 
     courses = []
     # Scope: explicit all-current-courses requests must bypass course scoring.
-    all_courses_scope = _is_all_courses_scope(user_input)
+    all_courses_scope = (
+        _is_all_courses_scope(user_input)
+        or _is_unscoped_all_courses_status_request(user_input, intent)
+    )
     explicit_courses = load_courses() if all_courses_scope else resolve_courses(
         user_input,
         allow_ai=True
@@ -4148,6 +4271,7 @@ def run_multiple_intents(
 
     """
     responses = []
+    grounded_sets = {}
     for intent in intents:
         if intent in [
             "assignment_details",
@@ -4158,19 +4282,24 @@ def run_multiple_intents(
             "selected_grade",
         ]:
             continue
-        result = run_single_intent(
-            intent,
-            user_input
-        )
+        result = run_single_intent(intent, user_input)
         if result:
-            responses.append(
-                result
-            )
+            responses.append(result)
+            state = _conversation_state.get("last_result_set") or {}
+            if state.get("items") and state.get("type") in {"quiz", "assignment", "course_resources"}:
+                grounded_sets[intent] = {
+                    "type": state.get("type"),
+                    "course_id": state.get("course_id"),
+                    "course_name": state.get("course_name"),
+                    "items": [dict(x) for x in state.get("items", []) if isinstance(x, dict)],
+                }
     if not responses:
         return None
-    return "\n\n".join(
-        responses
-    )
+    # Preserve every grounded domain from a multi-intent answer. A later phrase
+    # such as "هات أول واحد من كل نوع" must not see only the final tool result.
+    _conversation_state["last_multi_result_sets"] = grounded_sets
+    _conversation_state["last_intent"] = "multi_intent"
+    return "\n\n".join(responses)
 
 
 # SAFE AI FALLBACK
@@ -4405,13 +4534,32 @@ def _maybe_answer_capability_question(user_input):
 
 
 def _is_simple_greeting(user_input):
-    """Recognize opening/social greetings without Moodle or Ollama."""
+    """Recognize a short social greeting without waking Moodle or Ollama.
+
+    Natural greetings often include a harmless form of address (for example
+    ``مساء الخير معلم``).  Treat the greeting as social only when it starts with
+    a known greeting and the whole turn stays short; this avoids swallowing a
+    real request such as ``مساء الخير، شو عندي واجبات؟``.
+    """
     text = normalize_text(user_input).strip(" .,!؟?")
-    greetings = {
+    exact = {
         "مرحبا", "مرحباا", "اهلا", "اهلين", "هلا", "هاي", "hello", "hi",
         "السلام عليكم", "سلام عليكم", "صباح الخير", "مساء الخير",
     }
-    return text in greetings
+    if text in exact:
+        return True
+    tokens = text.split()
+    if not tokens or len(tokens) > 4:
+        return False
+    prefixes = ("السلام عليكم", "سلام عليكم", "صباح الخير", "مساء الخير", "مرحبا", "اهلا", "اهلين", "هلا", "هاي", "hello", "hi")
+    if not any(text == prefix or text.startswith(prefix + " ") for prefix in prefixes):
+        return False
+    request_markers = {
+        "شو", "ايش", "اش", "ماذا", "هل", "في", "عندي", "بدي", "بدك",
+        "واجب", "واجبات", "كويز", "كويزات", "حضور", "ملف", "ملفات",
+        "what", "do", "can", "assignment", "quiz", "attendance", "file",
+    }
+    return not any(token in request_markers for token in tokens)
 
 
 def _is_agent_identity_question(user_input):
@@ -4459,6 +4607,67 @@ def _is_social_acknowledgement(user_input):
     return bool(tokens and len(tokens) <= 3 and all(token in social_tokens for token in tokens))
 
 
+def _is_social_smalltalk(user_input):
+    """Recognize ordinary human conversation that needs no university data.
+
+    This gate is intentionally conservative: any clear university/data/action
+    marker keeps the turn out of the social path.  It catches mood/status,
+    thanks, feedback and casual check-ins so they never wake Moodle/Ollama.
+    """
+    text = normalize_text(user_input).strip(" .,!؟?")
+    if not text or len(text.split()) > 10:
+        return False
+    university_markers = [
+        "واجب", "كويز", "اختبار", "حضور", "غياب", "ماده", "مادة", "مساق",
+        "ملف", "مودل", "moodle", "علامه", "علامتي", "درجه", "موعد", "تسليم",
+        "جدول", "محاضره", "course", "assignment", "quiz", "attendance", "grade",
+    ]
+    if contains_any(text, university_markers):
+        return False
+    smalltalk_markers = [
+        "الحمد لله", "الحمد الله", "انا منيح", "انا ممتاز", "ممتاز اليوم",
+        "اليوم ممتاز", "كيفك", "كيف حالك", "شو اخبارك", "شو الاخبار",
+        "هيك احسن", "هيك افضل", "ردودك احسن", "عجبني ردك", "حبيت ردك",
+        "يسعدك", "الله يسعدك", "تسلم", "يسلم راسك",
+    ]
+    return contains_any(text, smalltalk_markers)
+
+
+def _is_social_complaint(user_input):
+    """Catch pure conversational complaints/corrections before course inference."""
+    text = normalize_text(user_input).strip(" .,!؟?")
+    if len(text.split()) > 12:
+        return False
+    # A complaint can contain a real request ("شو بتخبص، هات واجباتي").
+    # In that case keep the turn in university routing instead of swallowing it.
+    university_markers = [
+        "واجب", "كويز", "اختبار", "حضور", "غياب", "ماده", "مادة", "مساق",
+        "ملف", "مودل", "moodle", "علامه", "درجه", "موعد", "تسليم", "جدول",
+        "assignment", "quiz", "attendance", "grade",
+    ]
+    if contains_any(text, university_markers):
+        return False
+    complaint_markers = [
+        "شو بتخبص", "بتخبص", "خربطت", "شو بتحكي", "مش هيك", "مو هيك",
+        "غلط فهمت", "فهمتني غلط", "شو هالرد", "ردك غلط", "اللووو", "الووو",
+        "مش قصدي", "مو قصدي", "بطي", "تأخرت", "تاخرت", "ليش بطول", "ليش بتطول",
+    ]
+    return contains_any(text, complaint_markers)
+
+
+def _social_smalltalk_response(user_input):
+    text = normalize_text(user_input)
+    if _is_social_complaint(user_input):
+        return "معك حق أخوي 😅 شكلي فهمت الحكي غلط. احكيلي قصدك وأنا بركز معك."
+    if contains_any(text, ["هيك احسن", "هيك افضل", "ردودك احسن", "عجبني ردك", "حبيت ردك"]):
+        return "هيك تمام 😄 المهم تحس إن الحكي طبيعي ومريح."
+    if contains_any(text, ["الحمد لله", "الحمد الله", "ممتاز اليوم", "اليوم ممتاز", "انا ممتاز", "انا منيح"]):
+        return "الحمد لله 😄 هيك بدي أسمع! شو بدك نعمل اليوم؟"
+    if contains_any(text, ["كيفك", "كيف حالك", "شو اخبارك", "شو الاخبار"]):
+        return "تمام معلم 😄 جاهز معك. إنت كيف أمورك؟"
+    return "يسعدك أخوي 😄"
+
+
 def _is_social_goodbye(user_input):
     text = normalize_text(user_input).strip(" .,!؟?")
     return any(phrase in text for phrase in [
@@ -4471,8 +4680,51 @@ def _is_all_courses_scope(user_input):
     text = normalize_text(user_input)
     return contains_any(text, [
         "كل المواد", "جميع المواد", "لكل المواد", "كل ماده", "كل مادة",
-        "على الموقع", "بالموقع", "الموجوده على الموقع", "الموجودة على الموقع"
+        "اي ماده", "أي مادة", "اي مادة", "أي ماده", "داخل اي ماده", "داخل أي مادة",
+        "على الموقع", "بالموقع", "الموقع بشكل عام", "بشكل عام",
+        "الموجوده على الموقع", "الموجودة على الموقع"
     ])
+
+
+def _is_unscoped_all_courses_status_request(user_input, intent):
+    """Treat genuinely global status questions as all-course requests.
+
+    An old active course must not hijack wording such as "is any attendance open
+    or was I marked absent?" when the current turn contains no course reference
+    and no referential phrase pointing back to the active course.
+    """
+    if intent not in {"attendance", "assignments", "quizzes", "course_files"}:
+        return False
+    if _explicit_course_marker(user_input):
+        return False
+
+    # The generic course-reference extractor is intentionally permissive and can
+    # leave predicate fragments such as "تفعل تسجيلي".  For this global-scope
+    # decision, only a REAL deterministic match to a current Moodle course counts
+    # as a named course.
+    try:
+        current_courses = load_courses()
+        if current_courses and deterministic_course_matches(user_input, current_courses):
+            return False
+    except Exception:
+        pass
+
+    text = normalize_text(user_input)
+    strong_global_markers = [
+        "هل يوجد", "اي حضور", "اي كويز", "اي واجب", "تم تسجيلي غياب",
+        "عندي غياب", "any attendance", "any quiz", "any assignment", "anything",
+    ]
+    if contains_any(text, strong_global_markers):
+        return True
+
+    referential = contains_any(text, [
+        "فيها", "فيه", "لهالماده", "لهالمادة", "بهاي الماده", "بهاي المادة",
+        "نفس الماده", "نفس المادة", "عنها", "عنه",
+    ])
+    if referential:
+        return False
+
+    return contains_any(text, ["هل في", "هل فيه", "في اشي", "في شي"])
 
 
 def _is_monitoring_capability_question(user_input):
@@ -4494,6 +4746,39 @@ def _monitoring_capability_response():
         "اه. بقدر أتابع تغييرات موادك مثل نزول واجب أو كويز أو ملف جديد وتغيّر الحضور. "
         "التنبيه التلقائي يعتمد على تشغيل الـmonitor/البوت؛ أما لما تسألني يدويًا بقدر أعمل تحديث مباشر من Moodle للمادة المطلوبة."
     )
+
+
+def _is_global_update_question(user_input):
+    """Recognize a broad 'what changed/new?' request without inventing a course."""
+    # Future subscriptions ("خبرني إذا نزل...") belong to the watch compiler,
+    # not to the current-update reader.
+    if _message_may_define_future_action(user_input):
+        return False
+    text = normalize_text(user_input)
+    update_signal = contains_any(text, [
+        "جديد", "صار", "حدث", "تحديث", "نشر", "نزل", "new", "update", "changed", "posted"
+    ])
+    broad_scope = _is_all_courses_scope(user_input) or contains_any(text, [
+        "اي اشي", "أي اشي", "اي شي", "أي شي", "اي شيء", "أي شيء",
+        "بشكل عام", "عموما", "عموماً", "anything", "general"
+    ])
+    return bool(update_signal and broad_scope)
+
+
+def _global_update_response(user_input):
+    """Answer from persistent monitor state; never claim an untracked change."""
+    snapshot = _event_state.snapshot(max_events=50, max_actions=20)
+    events = snapshot.get("unacknowledged_events") or []
+    base = _format_unacknowledged_events(events)
+    text = normalize_text(user_input)
+    asks_files = _fuzzy_token_matches(text, ["ملف", "ملفات", "file", "files", "resource", "resources"])
+    if asks_files:
+        return (
+            base
+            + "\n\nملاحظة: المراقبة الحالية بتسجل تغييرات الواجبات والكويزات والحضور، "
+              "لكنها لسه ما بتسجل رفع ملفات المادة كحدث مستقل؛ لذلك ما رح أخمّن إذا ملف جديد انرفع."
+        )
+    return base
 
 
 def _is_whats_new_question(user_input):
@@ -4804,6 +5089,73 @@ def _grounded_assignment_followup(user_input):
     return None
 
 
+def _quiz_reference_grade_followup(user_input):
+    """Resolve grounded quiz-grade pronouns before Agent Core/Moodle rescans.
+
+    Examples: "هات علامته", "علامتها", "علامات كل منهم", "علاماتهم".
+    Singular references bind to the active quiz, then the most recent grounded
+    quiz in the active course, then the most recent grounded quiz overall.
+    Plural references prefer the visible quiz result-set; when the conversation
+    just selected quizzes from different courses, they bind to those recent
+    distinct grounded quizzes instead.
+    """
+    text = normalize_text(user_input).strip(" .,!؟?")
+    grade_signal = contains_any(text, ["علام", "درج", "grade", "score", "mark"])
+    if not grade_signal:
+        return None
+
+    plural_reference = contains_any(text, [
+        "كل منهم", "كلهم", "فيهم", "منهم", "علاماتهم", "علاماتهن", "درجاتهم", "their grades"
+    ])
+    singular_reference = contains_any(text, [
+        "علامته", "علامتها", "درجته", "درجتها", "علامة هاض", "علامه هاض",
+        "علامة هذا", "علامه هذا", "علامة هاي", "علامه هاي", "its grade", "his grade"
+    ])
+    if not (plural_reference or singular_reference):
+        return None
+
+    # An explicit course/object request belongs to normal routing, not pronoun state.
+    if _explicit_course_marker(user_input):
+        return None
+    courses = load_courses()
+    direct = deterministic_course_matches(user_input, courses) if courses else []
+    if direct:
+        return None
+
+    if plural_reference:
+        visible = _last_result_items("quiz")
+        # A real multi-item visible quiz list is the strongest antecedent.
+        if len(visible) > 1:
+            return handle_quiz_grades(user_input, quizzes=visible)
+        recent = _recent_distinct_entities("quiz", limit=4)
+        if len(recent) >= 2:
+            grades = []
+            for quiz in recent:
+                course_name = quiz.get("course_name") or quiz.get("course")
+                result = get_quiz_grades(course_name=course_name, quizzes=[quiz])
+                if isinstance(result, list) and result:
+                    grades.append(result[0])
+            if grades:
+                save_context(
+                    intent="quiz_grades", tool_name="get_quiz_grades", entity_type="quiz_list",
+                    selected_items=grades, raw_result=grades, display_result=grades, user_input=user_input,
+                )
+                return format_quiz_grades(grades)
+        if visible:
+            return handle_quiz_grades(user_input, quizzes=visible)
+        return None
+
+    active = _active_entity_item("quiz")
+    if not active:
+        active_course = _conversation_state.get("active_course") or {}
+        active = _recent_entity("quiz", course_id=active_course.get("id"))
+    if not active:
+        active = _recent_entity("quiz")
+    if not active:
+        return None
+    return handle_quiz_grades(user_input, quizzes=[active])
+
+
 def _grounded_quiz_followup(user_input):
     """Answer metadata questions about the currently selected quiz locally."""
     quiz = _active_entity_item("quiz")
@@ -4885,14 +5237,190 @@ def _pending_work_followup(user_input):
     return None
 
 
+def _course_resource_content_followup(user_input):
+    """Fail closed when the user asks about file contents we have not fetched.
+
+    The course-resource tool currently grounds names/types/URLs, not the bytes or
+    parsed contents of those files.  Open-ended LLM reasoning must therefore not
+    pretend it read them.
+    """
+    state = _conversation_state.get("last_result_set") or {}
+    if state.get("type") != "course_resources":
+        return None
+
+    text = normalize_text(user_input)
+    asks_content = contains_any(text, [
+        "اقراهم", "اقرأهم", "تقراهم", "تقرأهم", "اقرا الملفات", "اقرأ الملفات", "اقراها", "اقرأها",
+        "حللهم", "حلل الملفات", "فيد باك", "اعطيني فيد باك", "اعطيني رايك", "اعطيني رأيك",
+        "شو محتواهم", "شو محتوى", "لخصهم", "لخص الملفات",
+        "read them", "read the files", "analyze them", "summarize them", "feedback",
+    ])
+    if not asks_content:
+        return None
+
+    items = [item for item in state.get("items", []) if isinstance(item, dict)]
+    if not items:
+        return "عندي سياق الملفات، لكن ما عندي محتوى ملف مقروء حتى أحلله بدون تخمين."
+
+    return (
+        "بقدر أعطيك فيدباك بعد قراءة المحتوى، لكن البيانات اللي جبتها من Moodle "
+        "حاليًا فيها أسماء وروابط الملفات فقط، مش محتوى الملفات نفسه. ما رح أدّعي "
+        "إني قرأتهم. لازم نربط تنزيل/قراءة ملفات Moodle أولًا أو تبعثلي الملف نفسه."
+    )
+
+
+def _attendance_context_link_followup(user_input):
+    """Resolve 'where is it / send it' from the last grounded attendance result."""
+    if _conversation_state.get("last_intent") != "attendance":
+        return None
+    text = normalize_text(user_input).strip(" .,!؟?")
+    asks_location = contains_any(text, [
+        "وين", "وينها", "وينه", "ارسلها", "ابعثها", "هات الرابط", "ابعث الرابط",
+        "ارسل الرابط", "خليني اشوف", "اشوف", "افتحها", "link", "send it", "where",
+    ])
+    if not asks_location:
+        return None
+    raw = _last_context.get("raw_result")
+    if not isinstance(raw, dict):
+        return None
+    url = raw.get("attendance_url") or (raw.get("discovery") or {}).get("attendance_url")
+    if url:
+        return f"هاي صفحة الحضور للمادة اللي بنحكي عنها:\n{url}"
+    return "صفحة الحضور موجودة بالسياق، بس Moodle ما رجّعلي رابط مباشر موثوق أبعثه إلك."
+
+
+def _language_preference_control(user_input):
+    """Handle reply-language preferences locally; never route them to Moodle."""
+    text = normalize_text(user_input).strip(" .,!؟?")
+    talks_about_reply = contains_any(text, [
+        "تحكي", "احكي", "جاوب", "رد", "ترد", "لغة", "language", "speak", "reply", "answer"
+    ])
+    if not talks_about_reply:
+        return None
+    if contains_any(text, ["عربي", "بالعربي", "بالعربية", "arabic"]):
+        return "أكيد أخوي، بحكي معك بالعربي."
+    if contains_any(text, ["انجليزي", "بالانجليزي", "بالإنجليزي", "english"]):
+        return "Sure — I’ll reply in English."
+    return None
+
+
+def _ambiguous_short_input_control(user_input):
+    """Fail closed for meaningless ultra-short turns instead of fuzzy tool routing."""
+    text = normalize_text(user_input).strip(" .,!؟?")
+    if len(text) <= 1 and not text.isdigit():
+        return "مش واضح قصدك أخوي؛ اكتبلي شوي أكثر."
+    return None
+
+
+def _unsubmitted_status_followup(user_input):
+    """Resolve submission-status refinements from grounded work context before the LLM."""
+    text = normalize_text(user_input)
+    markers = [
+        "ما تم تسليم", "ماتم تسليم", "مش مسلم", "غير مسلم", "غير مسلّم",
+        "ما سلمت", "ماسلمت", "لسا ما سلم", "لسه ما سلم", "not submitted", "unfinished"
+    ]
+    if not contains_any(text, markers):
+        return None
+    has_work_context = bool(
+        (_conversation_state.get("last_result_set") or {}).get("type") in {"assignment", "quiz"}
+        or (_conversation_state.get("last_multi_result_sets") or {})
+        or _conversation_state.get("last_intent") in {"assignments", "quizzes", "multi_intent", "pending_work"}
+    )
+    if not has_work_context:
+        return None
+    # get_pending_work is the grounded Moodle status tool. It may truthfully return
+    # Unknown when Moodle does not expose enough submission/attempt evidence.
+    return run_single_intent("pending_work", user_input)
+
+
+def _multi_result_selection_followup(user_input):
+    """Select first/last/ordinal item independently from each prior result domain."""
+    sets = _conversation_state.get("last_multi_result_sets") or {}
+    if len(sets) < 2:
+        return None
+    text = normalize_text(user_input)
+    per_type = contains_any(text, ["من كل نوع", "كل نوع", "each type", "each one"])
+    if not per_type:
+        return None
+    quick = _fast_semantic_analysis(user_input)
+    selection = quick.get("selection")
+    count = quick.get("count")
+    # "أول واحد من كل نوع" contains both an ordinal and the word "كل".
+    # For per-domain selection the ordinal describes WHICH item, while "كل"
+    # describes WHICH domains, so the ordinal must win locally.
+    ordinal = extract_ordinal_index(text)
+    if ordinal == 1:
+        selection, count = "first", 1
+    elif isinstance(ordinal, int) and ordinal > 1:
+        selection, count = "ordinal", ordinal
+    if selection not in {"first", "last", "ordinal"}:
+        return None
+    selected = []
+    responses = []
+    new_sets = {}
+    for intent in ("quizzes", "assignments", "course_files"):
+        state = sets.get(intent)
+        if not state:
+            continue
+        items = [dict(x) for x in state.get("items", []) if isinstance(x, dict)]
+        if not items:
+            continue
+        if selection == "last":
+            idx = len(items) - 1
+        elif selection == "ordinal" and isinstance(count, int):
+            idx = count - 1
+        else:
+            idx = 0
+        if idx < 0 or idx >= len(items):
+            continue
+        item = items[idx]
+        selected.append((intent, item, state))
+        new_sets[intent] = {**state, "items": [item]}
+        if intent == "quizzes":
+            responses.append(format_quizzes([item], user_input))
+            _remember_recent_entity("quiz", item)
+        elif intent == "assignments":
+            responses.append(format_assignments([item]))
+            _remember_recent_entity("assignment", item)
+        else:
+            responses.append(format_course_resources([item]) if "format_course_resources" in globals() else str(item.get("name") or item.get("title") or "الملف"))
+            _remember_recent_entity("course_resource", item)
+    if not responses:
+        return None
+    _conversation_state["last_multi_result_sets"] = new_sets
+    _conversation_state["last_intent"] = "multi_intent"
+    # Keep the most recently selected grounded entity available for singular follow-ups,
+    # while the multi sets preserve both domains for "كل منهم" style references.
+    if selected:
+        intent, item, state = selected[-1]
+        kind = "quiz" if intent == "quizzes" else "assignment" if intent == "assignments" else "course_resource"
+        _conversation_state["active_entity"] = {"type": kind, "item": dict(item), "course_id": state.get("course_id")}
+    return "\n\n".join(responses)
+
+
 def _state_first_followup(user_input):
     """Conversation-state router that runs before semantic/course inference."""
+    multi_selection = _multi_result_selection_followup(user_input)
+    if multi_selection is not None:
+        return multi_selection
+    unsubmitted = _unsubmitted_status_followup(user_input)
+    if unsubmitted is not None:
+        return unsubmitted
+    attendance_link = _attendance_context_link_followup(user_input)
+    if attendance_link is not None:
+        return attendance_link
+    resource_response = _course_resource_content_followup(user_input)
+    if resource_response is not None:
+        return resource_response
     selected = _selection_from_last_result(user_input)
     if selected is not None:
         return selected
     assignment_response = _grounded_assignment_followup(user_input)
     if assignment_response is not None:
         return assignment_response
+    grade_reference = _quiz_reference_grade_followup(user_input)
+    if grade_reference is not None:
+        return grade_reference
     quiz_response = _grounded_quiz_followup(user_input)
     if quiz_response is not None:
         return quiz_response
@@ -4921,18 +5449,75 @@ def _safe_auto_course_alias(reference):
         "اول", "الاول", "ثاني", "الثاني", "ثالث", "الثالث", "رابع", "الرابع",
         "خامس", "الخامس", "سادس", "السادس", "سابع", "السابع", "ثامن", "الثامن",
         "تاسع", "التاسع", "عاشر", "العاشر", "جديد", "حاليا", "تسليم", "تسليمه",
+        "تخبص", "خربطت", "اللووو", "الووو", "غلط", "فهمتني", "ردك", "قصدي",
+        "كيفك", "اخبارك", "الحمد", "ممتاز", "احسن", "افضل",
     }
     return not any(token in blocked for token in tokens)
+
+
+def _natural_greeting_response(user_input):
+    """Return a warm local greeting without waking Moodle or Ollama.
+
+    The wording varies by the greeting itself rather than by mutable state, so the
+    fast path stays thread-safe and deterministic for regression tests.
+    """
+    text = normalize_text(user_input)
+    correction = contains_any(text, ["قلت", "حكيتلك", "بحكيلك", "برد عليك", "رد علي"])
+    if correction:
+        return "مسا النور معلم 😄 وصلتني، أهلين وسهلين فيك. شو الأخبار؟"
+    if contains_any(text, ["مساء الخير"]):
+        variants = [
+            "مسا النور معلم 😄 أهلين فيك، شو الأخبار؟",
+            "مسا الورد أخوي 😄 هلا والله، كيف أمورك؟",
+            "يا مسا النور معلم 👋 أهلين وسهلين، شو عامل؟",
+        ]
+    elif contains_any(text, ["صباح الخير"]):
+        variants = [
+            "صباح النور أخوي ☀️ هلا والله، كيفك اليوم؟",
+            "يسعد صباحك معلم 😄 شو الأخبار؟",
+            "صباح الورد أخوي 👋 كيف أمورك؟",
+        ]
+    elif contains_any(text, ["السلام عليكم", "سلام عليكم"]):
+        variants = [
+            "وعليكم السلام ورحمة الله أخوي 😄 أهلين فيك.",
+            "وعليكم السلام معلم 👋 يا هلا والله.",
+            "وعليكم السلام أخوي، أهلين وسهلين 😄",
+        ]
+    else:
+        variants = [
+            "هلا والله أخوي 😄 شو الأخبار؟",
+            "يا هلا معلم 👋 كيف أمورك؟",
+            "أهلين أخوي 😄 شو عامل؟",
+        ]
+    index = sum(ord(char) for char in text) % len(variants)
+    return variants[index]
+
+
+def _is_social_response_style_request(user_input):
+    """Recognize requests about how the agent should sound, not university data.
+
+    This is intentionally semantic/category based: the turn must talk about the
+    agent's reply/style and ask for a natural/friendly/human-like tone.
+    """
+    text = normalize_text(user_input)
+    reply_markers = ["رد", "ردك", "جوابك", "اسلوبك", "طريقة حكيك", "ترحيب", "greeting", "reply"]
+    style_markers = ["طبيعي", "قريب", "ودود", "بشري", "مش بوت", "مو بوت", "كانك انسان", "كأنك انسان", "friendly", "natural"]
+    return contains_any(text, reply_markers) and contains_any(text, style_markers)
 
 
 def get_fast_conversation_response(user_input):
     """Return only cheap, side-effect-free social/control replies.
 
-    Telegram may call this while a heavier agent turn is still running, so this
-    helper must never touch Moodle, Ollama, or mutable result-selection state.
+    This helper never touches Moodle, Ollama, or mutable result-selection state.
+    Telegram is responsible for preserving arrival order before sending a fast
+    response while another turn is still running.
     """
+    if _is_social_response_style_request(user_input):
+        return "معك حق أخوي 😄 بدي أحكي معك بشكل طبيعي وقريب، مش بردود جامدة. هلا والله فيك، شو الأخبار؟"
+    if _is_social_complaint(user_input) or _is_social_smalltalk(user_input):
+        return _social_smalltalk_response(user_input)
     if _is_simple_greeting(user_input):
-        return "مرحبا أخوي 👋 كيف فيني أساعدك اليوم؟"
+        return _natural_greeting_response(user_input)
     if _is_social_goodbye(user_input):
         return "وانت من أهله أخوي 🌙 تصبح على خير."
     if _is_social_acknowledgement(user_input):
@@ -4946,13 +5531,23 @@ def get_fast_conversation_response(user_input):
 
 def _conversation_control(user_input):
     """Cheap deterministic layer that runs before semantic/course routing."""
+    language_control = _language_preference_control(user_input)
+    if language_control is not None:
+        return language_control
+    ambiguous_short = _ambiguous_short_input_control(user_input)
+    if ambiguous_short is not None:
+        return ambiguous_short
+    # A correction/complaint means the previous clarification was not accepted.
+    # Cancel it so a later bare number cannot bind to a bad old interpretation.
+    if _is_social_complaint(user_input):
+        _clear_pending_course_resolution()
     fast_response = get_fast_conversation_response(user_input)
     if fast_response is not None:
         return fast_response
+    if _is_global_update_question(user_input):
+        return _global_update_response(user_input)
     if _is_whats_new_question(user_input):
-        return ("بقدر أتفقد الوضع الحالي، بس حتى أحكيلك شو «الجديد» بالضبط لازم يكون عندي "
-                "سجل مقارنة من آخر فحص. هاي رح تصير تلقائية مع المراقبة 24/7؛ حاليًا اسألني عن "
-                "الواجبات أو الكويزات أو الحضور الحالي وبفحصهم مباشرة.")
+        return _global_update_response(user_input)
     selected_resource = _handle_course_resource_selection_followup(user_input)
     if selected_resource is not None:
         return selected_resource
@@ -5063,6 +5658,21 @@ def _build_high_confidence_future_watch(user_input):
         if intent in trigger_by_intent:
             trigger_type = trigger_by_intent[intent]
             break
+
+    # Structural fallback for future-event wording.  This is intentionally based
+    # on capability classes rather than sentence templates, so a local semantic
+    # arbitration quirk cannot turn "notify me when a quiz date is set" into a
+    # slow planner clarification.
+    if not trigger_type:
+        text = normalize_text(user_input)
+        if _fuzzy_token_matches(text, ["كويز", "كويزات", "كوز", "كوزات", "quiz", "quizzes", "اختبار"]):
+            trigger_type = "quiz_added"
+        elif _fuzzy_token_matches(text, ["واجب", "واجبات", "assignment", "assignments", "homework"]):
+            trigger_type = "assignment_added"
+        elif _fuzzy_token_matches(text, ["حضور", "attendance"]):
+            trigger_type = "attendance_opened"
+        elif contains_any(text, ["موعد تسليم", "deadline", "deadline near"]):
+            trigger_type = "deadline_near"
 
     if not trigger_type:
         return None
@@ -5698,6 +6308,13 @@ def process_user_message(user_input):
     if capability is not None:
         return capability
 
+    # A clarification answer (for example just ``1``) belongs to the pending
+    # clarification state and must be consumed BEFORE Agent Core sees it as a new
+    # free-standing message.
+    pending_answer = _handle_pending_course_answer(user_input)
+    if pending_answer is not None:
+        return pending_answer
+
     # Grounded conversational state wins before any LLM planning.  A correction
     # such as "بدي الأول بس" after a resource/assignment/quiz list is already
     # unambiguous and should be resolved instantly from the known result set.
@@ -5712,10 +6329,6 @@ def process_user_message(user_input):
     if core_response is not None:
         return core_response
 
-    # Pending course clarification / active learning
-    pending_answer = _handle_pending_course_answer(user_input)
-    if pending_answer is not None:
-        return pending_answer
     # Exit
     if normalize_text(
         user_input
@@ -5771,8 +6384,19 @@ def process_user_message(user_input):
         return _state_aware_general_response(user_input)
 
     # Detect intents
+    effective_user_input = user_input
     if inherited_intent is not None:
         intents = [inherited_intent]
+        # Inherit a narrow selection (first/last/ordinal) together with the action.
+        # Example: "هات أول كويز من الروبتات" -> "ولحوسبة كمان" means the
+        # first Cloud quiz too, not the entire Cloud quiz list.
+        previous_quick = _fast_semantic_analysis(str(_last_context.get("user_input") or ""))
+        if quick.get("selection") == "none" and previous_quick.get("selection") in {"first", "last", "ordinal"}:
+            selection_word = {"first": "اول", "last": "اخر"}.get(previous_quick.get("selection"))
+            if previous_quick.get("selection") == "ordinal" and isinstance(previous_quick.get("count"), int):
+                selection_word = f"رقم {previous_quick.get('count')}"
+            if selection_word:
+                effective_user_input = f"{user_input} {selection_word}"
         print(f"[DEBUG] Inherited previous intent: {inherited_intent}")
     else:
         intents = detect_intents(user_input)
@@ -5800,7 +6424,7 @@ def process_user_message(user_input):
         if intent in intents:
             result = run_single_intent(
                 intent,
-                user_input
+                effective_user_input
             )
             if result:
                 return result
@@ -5813,7 +6437,7 @@ def process_user_message(user_input):
     if len(normal_intents) > 1:
         result = run_multiple_intents(
             normal_intents,
-            user_input
+            effective_user_input
         )
         if result:
             return result
@@ -5822,7 +6446,7 @@ def process_user_message(user_input):
     # second time here can lose inherited intents and needlessly invoke Ollama.
     primary = normal_intents[0] if len(normal_intents) == 1 else detect_primary_intent(user_input)
     if primary:
-        result = run_single_intent(primary, user_input)
+        result = run_single_intent(primary, effective_user_input)
         if result:
             return result
     # Safe fallback

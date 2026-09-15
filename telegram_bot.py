@@ -318,36 +318,15 @@ def _start_message_worker():
 
 
 def _try_fast_response(update):
-    """Reply immediately to side-effect-free social/control turns.
+    """Keep every conversational turn on the same FIFO worker.
 
-    This runs in the polling thread, so a greeting such as "مساء الخير" can be
-    answered even while the background agent worker is handling a slow Moodle or
-    local-LLM request. Stateful university turns are never handled here.
+    Earlier versions sent social replies directly from the polling thread. That
+    made greetings instant, but allowed a newer greeting to overtake an older
+    slow Agent Core response. The fast logic still exists in ``main.py``; it now
+    executes inside the ordered worker and remains effectively instant whenever
+    no older message is ahead of it.
     """
-    chat_id, text = _extract_text_message(update)
-    if chat_id is None:
-        return False
-
-    if text.lower() in {"/start", "/help"}:
-        return False
-
-    try:
-        response_text = get_fast_conversation_response(text)
-    except Exception as error:
-        print(f"[TELEGRAM] Fast-response check failed: {error}")
-        return False
-
-    if response_text is None:
-        return False
-
-    _print_incoming(chat_id, text)
-    print("[TELEGRAM] Fast local response (no Moodle/Ollama).")
-    success = send_long_message(chat_id, response_text)
-    if success:
-        print("[TELEGRAM] Fast response sent successfully.")
-    else:
-        print("[TELEGRAM] Fast response failed.")
-    return True
+    return False
 
 
 # ============================================================
@@ -386,8 +365,8 @@ def start_bot():
                     if update_id is not None:
                         offset = update_id + 1
 
-                    # Social/control messages can be answered immediately even
-                    # while one heavy agent turn is running in the worker.
+                    # Fast social logic still runs inside the same FIFO worker so a
+                    # newer message can never overtake an older slow turn.
                     if _try_fast_response(update):
                         continue
 

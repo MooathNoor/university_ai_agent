@@ -64,8 +64,9 @@ def run():
     check("solve example 3" in response, f"natural detail follow-up failed: {response}")
 
     response = agent.process_user_message("هات حله")
-    check("حل تجريبي" in response, f"solve turn did not stay on selected assignment: {response}")
-    check(len(solution_calls) == 1, f"solve flow used LLM unexpected number of times: {len(solution_calls)}")
+    check("ما يحتوي السؤال نفسه" in response, f"reference-only assignment was not blocked safely: {response}")
+    check("صورة" in response or "نص السؤال" in response, f"missing-source request was unclear: {response}")
+    check(len(solution_calls) == 0, f"reference-only solve request should not reach the LLM: {len(solution_calls)}")
 
     # Scenario 3: no conversational fragment may be auto-learned as a course alias.
     learned = {
